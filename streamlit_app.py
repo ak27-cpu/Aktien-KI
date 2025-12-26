@@ -14,7 +14,7 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
     # Liest das Blatt "Aktien-Ki" (Ticker, Manueller_Fairer_Wert, Notizen)
-    return conn.read(worksheet="Aktien-Ki")
+    return conn.read(worksheet="Aktien-KI")
 
 def get_stock_metrics(ticker):
     try:
