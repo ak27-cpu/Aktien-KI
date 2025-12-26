@@ -2,93 +2,114 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import yfinance as yf
 import pandas as pd
-import datetime
 
-# --- UI KONFIGURATION ---
-st.set_page_config(page_title="Aktien-KI Watchlist", layout="wide")
+# --- SEITEN-KONFIGURATION ---
+st.set_page_config(page_title="KI Aktien-Watchlist", layout="wide", initial_sidebar_state="collapsed")
+
 st.title("🚀 Meine KI-Aktien-Watchlist")
-st.write("Analysiert Verschuldung, Trends und Korrektur-Größen live.")
+st.markdown("Analysiere Verschuldung (< 60%), Trends und Korrektur-Größen live.")
 
-# --- VERBINDUNG ZUM GOOGLE SHEET ---
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- DATENBANK-VERBINDUNG ---
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception as e:
+    st.error(f"Verbindungsfehler zur GSheets-Schnittstelle: {e}")
 
-def load_data():
-    # Liest das Blatt "Aktien-Ki" (Ticker, Manueller_Fairer_Wert, Notizen)
-    return conn.read(worksheet="Aktien-KI")
-
-def get_stock_metrics(ticker):
+@st.cache_data(ttl=3600)  # Daten für 1 Stunde cachen
+def get_stock_data(ticker):
+    """Holt alle relevanten Kennzahlen von yfinance."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        hist = stock.history(period="3y") # Für Trend-Check
+        hist = stock.history(period="2y")
         
-        # Fundamentale Daten
-        price = info.get('currentPrice', 0)
-        debt_equity = info.get('debtToEquity', 0) / 100 # In Dezimal umrechnen
-        pe_ratio = info.get('trailingPE', 0)
-        ath_52w = info.get('fiftyTwoWeekHigh', 1)
+        if hist.empty:
+            return None
+
+        # Aktueller Kurs und 52-Wochen-Hoch
+        current_price = info.get('currentPrice') or hist['Close'].iloc[-1]
+        ath_52w = info.get('fiftyTwoWeekHigh') or hist['High'].max()
         
-        # Berechnung Korrektur
-        current_correction = ((price / ath_52w) - 1) * 100
+        # Fundamentaldaten
+        # yfinance gibt debtToEquity oft als Prozent (z.B. 40.5) oder Faktor (0.405) aus
+        de_raw = info.get('debtToEquity', 0)
+        debt_equity = de_raw / 100 if de_raw > 2 else de_raw
+        
+        pe_ratio = info.get('trailingPE')
+        
+        # Berechnungen
+        correction = ((current_price / ath_52w) - 1) * 100
         
         # Trend-Check (SMA 200)
-        sma200 = hist['Close'].rolling(window=200).mean()
-        current_sma = sma200.iloc[-1]
-        trend_ok = "✅ Aufwärtstrend" if price > current_sma else "⚠️ Abwärtstrend"
+        sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
+        trend = "Aufwärts ✅" if current_price > sma200 else "Abwärts ⚠️"
         
-        # Durchschnittliche Korrektur (Dips der letzten 3 Jahre)
-        # Vereinfachte Logik: Durchschnitt der monatlichen Rücksetzer
-        monthly_lows = hist['Low'].resample('M').min()
-        monthly_highs = hist['High'].resample('M').max()
-        avg_dip = ((monthly_lows / monthly_highs) - 1).mean() * 100
+        # Historische Dips (vereinfacht: Max Drawdown der letzten 2 Jahre)
+        roll_max = hist['Close'].cummax()
+        daily_drawdown = hist['Close'] / roll_max - 1.0
+        avg_drawdown = daily_drawdown.min() * 100 # Tiefster Punkt als Referenz
 
         return {
-            "Kurs": price,
-            "KGV": pe_ratio,
-            "Schulden_Quote": debt_equity,
-            "Korrektur_%": current_correction,
-            "Ø_Korrektur_%": avg_dip,
-            "Trend": trend_ok
+            "Kurs": round(current_price, 2),
+            "KGV": round(pe_ratio, 2) if pe_ratio else "N/A",
+            "Schulden_Quote": round(debt_equity, 3),
+            "Korrektur_%": round(correction, 2),
+            "Max_Dip_2J_%": round(avg_drawdown, 2),
+            "Trend": trend
         }
-    except:
+    except Exception as e:
         return None
 
-# --- HAUPTPROGRAMM ---
-df_watchlist = load_data()
-
-if not df_watchlist.empty:
-    results = []
+# --- HAUPTTEIL ---
+try:
+    # Wir lesen das erste verfügbare Blatt, falls "Watchlist" nicht gefunden wird
+    df_watchlist = conn.read()
     
-    for index, row in df_watchlist.iterrows():
-        ticker = row['Ticker']
-        with st.spinner(f'Analysiere {ticker}...'):
-            metrics = get_stock_metrics(ticker)
-            if metrics:
-                # Kombiniere Sheet-Daten mit Live-Daten
-                combined = {**row, **metrics}
-                results.append(combined)
+    if df_watchlist is not None and not df_watchlist.empty:
+        # Ticker-Spalte finden (ignoriert Groß/Kleinschreibung)
+        df_watchlist.columns = [c.strip() for c in df_watchlist.columns]
+        ticker_col = next((c for c in df_watchlist.columns if c.lower() == 'ticker'), None)
 
-    df_final = pd.DataFrame(results)
+        if ticker_col:
+            all_results = []
+            
+            for index, row in df_watchlist.iterrows():
+                symbol = str(row[ticker_col]).strip()
+                if symbol and symbol != "nan":
+                    with st.status(f"Analysiere {symbol}...", expanded=False):
+                        metrics = get_stock_data(symbol)
+                        if metrics:
+                            # Kombiniere Daten aus Google Sheet mit Live-Daten
+                            combined = {**row.to_dict(), **metrics}
+                            all_results.append(combined)
+            
+            if all_results:
+                df_final = pd.DataFrame(all_results)
+                
+                # --- STYLING ---
+                def style_rows(row):
+                    # Kriterium: Verschuldung unter 60% (0.6)
+                    color = 'background-color: rgba(0, 255, 0, 0.1)' if row['Schulden_Quote'] < 0.6 else ''
+                    return [color] * len(row)
 
-    # --- FILTER & LOGIK ANWENDEN ---
-    def highlight_debt(val):
-        color = 'background-color: #90EE90' if val < 0.6 else 'background-color: #FFB6C1'
-        return color
+                st.subheader("Analyse-Ergebnisse")
+                st.dataframe(
+                    df_final.style.apply(style_rows, axis=1),
+                    use_container_width=True
+                )
+                
+                # --- INFO BOXEN ---
+                st.sidebar.header("Kriterien-Check")
+                st.sidebar.info("🟢 Grün: Verschuldung < 60%\n\n✅ Trend: Kurs > SMA200")
+                
+            else:
+                st.warning("Keine gültigen Daten für die Ticker gefunden.")
+        else:
+            st.error("Spalte 'Ticker' nicht im Google Sheet gefunden!")
+    else:
+        st.info("Das Google Sheet ist leer oder konnte nicht geladen werden.")
 
-    # Tabelle anzeigen
-    st.subheader("Deine Watchlist Analyse")
-    st.dataframe(df_final.style.applymap(highlight_debt, subset=['Schulden_Quote']))
+except Exception as e:
+    st.error(f"Kritischer Fehler beim Laden der App: {e}")
+    st.info("Tipp: Überprüfe, ob deine GSheet-URL in den Secrets korrekt ist.")
 
-    # --- MANUELLE ANPASSUNG ---
-    st.divider()
-    st.subheader("Manuelle Anpassungen & Notizen")
-    selected_ticker = st.selectbox("Aktie auswählen zum Bearbeiten:", df_final['Ticker'])
-    
-    new_fair_value = st.number_input("Fairer Wert anpassen:")
-    new_note = st.text_area("Neue Information / Notiz:")
-
-    if st.button("Änderungen im Google Sheet speichern"):
-        # Hier würde die Logik stehen, um die Zeile im Sheet zu überschreiben
-        st.success(f"Daten für {selected_ticker} wurden im Google Sheet aktualisiert!")
-else:
-    st.info("Dein Google Sheet ist noch leer. Füge Ticker in das Blatt 'Watchlist' ein.")
