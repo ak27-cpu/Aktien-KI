@@ -3,6 +3,13 @@ from streamlit_gsheets import GSheetsConnection
 import yfinance as yf
 import pandas as pd
 
+# Fix für Zeilenumbrüche im Key
+if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+    fixed_key = st.secrets["connections"]["gsheets"]["private_key"].replace("\\n", "\n")
+    # Wir überschreiben den Key im Speicher für die Sitzung
+    st.secrets["connections"]["gsheets"]["private_key"] = fixed_key
+
+
 # --- SEITEN-KONFIGURATION ---
 st.set_page_config(page_title="KI Aktien-Watchlist", layout="wide", initial_sidebar_state="collapsed")
 
