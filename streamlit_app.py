@@ -14,27 +14,37 @@ st.markdown("Analysiert Verschuldung, Trends und Korrektur-Größen live.")
 @st.cache_resource
 def get_gspread_client():
     try:
-        # Credentials aus den Secrets laden
-        creds_dict = dict(st.secrets["connections"]["gsheets"])
+        # 1. Daten aus den Secrets holen
+        s_creds = st.secrets["connections"]["gsheets"]
         
-        # DNS & URL Fix: Wir erzwingen die stabilere API-Adresse
-        creds_dict["token_uri"] = "https://oauth2.googleapis.com/token"
+        # 2. Ein sauberes Dictionary erstellen (verhindert 'str to seekable bit stream' Fehler)
+        creds_info = {
+            "type": s_creds["type"],
+            "project_id": s_creds["project_id"],
+            "private_key_id": s_creds["private_key_id"],
+            "private_key": s_creds["private_key"].replace("\\n", "\n"),
+            "client_email": s_creds["client_email"],
+            "client_id": s_creds["client_id"],
+            "auth_uri": s_creds["auth_uri"],
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": s_creds["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": s_creds["client_x509_cert_url"]
+        }
         
-        # Key-Reparatur für Zeilenumbrüche
-        if "private_key" in creds_dict:
-            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-        
-        # Scopes für Google Sheets & Drive
+        # Scopes definieren
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
         
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        # 3. Credentials explizit aus dem Dictionary laden
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         return gspread.authorize(creds)
+        
     except Exception as e:
         st.error(f"Fehler bei der Credential-Prüfung: {e}")
         return None
+
 
 # --- AKTIEN-ANALYSE LOGIK ---
 @st.cache_data(ttl=3600)
