@@ -1,148 +1,50 @@
 import streamlit as st
 import gspread
+import json
 from google.oauth2.service_account import Credentials
 import yfinance as yf
 import pandas as pd
 
-# --- SEITEN-KONFIGURATION ---
-st.set_page_config(page_title="KI Aktien-Watchlist", layout="wide")
-
-st.title("🚀 Meine KI-Aktien-Watchlist")
-st.markdown("Analysiert Verschuldung, Trends und Korrektur-Größen live.")
-
-# --- GOOGLE SHEETS VERBINDUNG ---
+# --- VERBINDUNG VIA JSON-BLOCK ---
 @st.cache_resource
 def get_gspread_client():
     try:
-        # 1. Daten aus den Secrets holen
-        s_creds = st.secrets["connections"]["gsheets"]
+        # 1. Den JSON-Text aus den Secrets laden
+        json_info = json.loads(st.secrets["gsheets"]["json_data"])
         
-        # 2. Ein sauberes Dictionary erstellen (verhindert 'str to seekable bit stream' Fehler)
-        creds_info = {
-            "type": s_creds["type"],
-            "project_id": s_creds["project_id"],
-            "private_key_id": s_creds["private_key_id"],
-            "private_key": s_creds["private_key"].replace("\\n", "\n"),
-            "client_email": s_creds["client_email"],
-            "client_id": s_creds["client_id"],
-            "auth_uri": s_creds["auth_uri"],
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": s_creds["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": s_creds["client_x509_cert_url"]
-        }
-        
-        # Scopes definieren
+        # 2. Scopes definieren
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
         
-        # 3. Credentials explizit aus dem Dictionary laden
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        # 3. Credentials direkt aus dem JSON-Objekt erstellen
+        creds = Credentials.from_service_account_info(json_info, scopes=scopes)
         return gspread.authorize(creds)
-        
     except Exception as e:
-        st.error(f"Fehler bei der Credential-Prüfung: {e}")
-        return None
-
-
-# --- AKTIEN-ANALYSE LOGIK ---
-@st.cache_data(ttl=3600)
-def get_stock_metrics(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="2y")
-        
-        if hist.empty:
-            return None
-
-        # Kennzahlen abrufen
-        price = info.get('currentPrice') or hist['Close'].iloc[-1]
-        
-        # Schulden-Quote (Debt to Equity)
-        de_raw = info.get('debtToEquity')
-        # Korrektur für Prozentwerte (manche Ticker geben 40.5 statt 0.405 aus)
-        debt_equity = (de_raw / 100) if (de_raw and de_raw > 2) else (de_raw or 0)
-        
-        # 52-Wochen-Hoch & Korrektur
-        ath_52w = info.get('fiftyTwoWeekHigh') or hist['High'].max()
-        correction = ((price / ath_52w) - 1) * 100
-        
-        # Trend (SMA 200)
-        sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
-        trend = "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️"
-        
-        return {
-            "Kurs": round(price, 2),
-            "KGV": info.get('trailingPE', "N/A"),
-            "Schulden_Quote": round(debt_equity, 3),
-            "Korrektur_%": round(correction, 2),
-            "Trend": trend
-        }
-    except Exception:
+        st.error(f"Verbindungsfehler: {e}")
         return None
 
 # --- HAUPTPROGRAMM ---
+st.title("🚀 Meine KI-Aktien-Watchlist")
+
 client = get_gspread_client()
 
 if client:
     try:
-        # Datei über den Namen öffnen
-        sh = client.open("Aktien-KI")
+        # Name aus Secrets holen
+        sheet_name = st.secrets["gsheets"]["spreadsheet_name"]
+        sh = client.open(sheet_name)
         worksheet = sh.get_worksheet(0)
         
-        # Daten in DataFrame laden
+        # Daten laden
         data = worksheet.get_all_records()
-        
-        if not data:
-            st.info("Das Google Sheet ist leer. Bitte trage Ticker in die erste Spalte ein.")
+        if data:
+            df = pd.DataFrame(data)
+            st.write("Daten erfolgreich geladen!", df.head())
+            # Hier kannst du nun deine yfinance-Logik dranhängen...
         else:
-            df_watchlist = pd.DataFrame(data)
+            st.warning("Das Sheet ist leer.")
             
-            # Suche die Ticker-Spalte
-            ticker_col = next((c for c in df_watchlist.columns if c.lower() == 'ticker'), None)
-
-            if ticker_col:
-                results = []
-                # Bereinige Ticker-Liste
-                ticker_liste = df_watchlist[ticker_col].dropna().unique().tolist()
-                
-                # Fortschrittsanzeige
-                progress_bar = st.progress(0)
-                for i, symbol in enumerate(ticker_liste):
-                    if not symbol: continue
-                    metrics = get_stock_metrics(str(symbol))
-                    if metrics:
-                        # Daten aus Sheet mit Live-Daten mischen
-                        original_row = df_watchlist[df_watchlist[ticker_col] == symbol].iloc[0].to_dict()
-                        results.append({**original_row, **metrics})
-                    progress_bar.progress((i + 1) / len(ticker_liste))
-                
-                if results:
-                    df_final = pd.DataFrame(results)
-                    
-                    # Styling: Grün markieren wenn Schulden < 60% (0.6)
-                    def highlight_debt(row):
-                        val = row.get('Schulden_Quote', 1.0)
-                        color = 'background-color: rgba(0, 255, 0, 0.15)' if isinstance(val, (int, float)) and val < 0.6 else ''
-                        return [color] * len(row)
-
-                    st.subheader("Aktuelle Analyse")
-                    st.dataframe(
-                        df_final.style.apply(highlight_debt, axis=1),
-                        use_container_width=True
-                    )
-                    
-                    st.caption("🟢 Markierung: Verschuldung unter 60% (Debt/Equity < 0.6)")
-                else:
-                    st.warning("Keine Live-Daten von Yahoo Finance empfangen.")
-            else:
-                st.error("Konnte keine Spalte mit dem Namen 'Ticker' finden.")
-
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error("Die Datei 'Aktien-KI' wurde nicht gefunden. Bitte prüfe den Namen in Google Sheets.")
     except Exception as e:
-        st.error(f"Verbindungsfehler: {e}")
-else:
-    st.error("Konnte keine Verbindung zu Google herstellen.")
+        st.error(f"Konnte das Sheet nicht öffnen: {e}")
