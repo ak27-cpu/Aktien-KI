@@ -13,8 +13,8 @@ st.write("Analysiert Verschuldung, Trends und Korrektur-Größen live.")
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
-    # Liest das Blatt "Watchlist" (Ticker, Manueller_Fairer_Wert, Notizen)
-    return conn.read(worksheet="Watchlist")
+    # Liest das Blatt "Aktien-Ki" (Ticker, Manueller_Fairer_Wert, Notizen)
+    return conn.read(worksheet="Aktien-Ki")
 
 def get_stock_metrics(ticker):
     try:
