@@ -1,4 +1,5 @@
 streamlit
-st-gsheets-connection
+gspread
+google-auth
 yfinance
 pandas
