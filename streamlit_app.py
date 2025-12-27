@@ -1,99 +1,66 @@
 import streamlit as st
+from supabase import create_client, Client
 import yfinance as yf
 import pandas as pd
 
-# --- SEITEN-KONFIGURATION ---
-st.set_page_config(page_title="KI Aktien-Watchlist", layout="wide")
+# --- VERBINDUNG ZU SUPABASE ---
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
 
-st.title("🚀 KI-Aktien-Watchlist (Demo-Modus)")
-st.info("Diese Version läuft ohne Google Sheet. Ticker können direkt unten hinzugefügt werden.")
+supabase = get_supabase()
 
-# --- DATEN-LOGIK (SIMULIERTES SHEET) ---
-# Hier definieren wir die Ticker, die normalerweise in deinem Sheet stehen würden
-if 'ticker_liste' not in st.session_state:
-    st.session_state.ticker_liste = ["AAPL", "MSFT", "TSLA", "NVDA", "ASML"]
+# --- DATEN LADEN ---
+def load_data():
+    # Holt alle Ticker aus der Supabase-Tabelle 'watchlist'
+    response = supabase.table("watchlist").select("*").execute()
+    return pd.DataFrame(response.data)
 
-# --- ANALYSE-FUNKTION ---
+# --- ANALYSE LOGIK ---
 @st.cache_data(ttl=3600)
-def get_stock_metrics(ticker):
+def get_metrics(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        hist = stock.history(period="2y")
-        
-        if hist.empty: return None
-
-        price = info.get('currentPrice') or hist['Close'].iloc[-1]
-        
-        # Schulden-Quote (Debt/Equity)
-        de_raw = info.get('debtToEquity')
-        # Korrektur: Viele Broker geben 40.5 aus, wir wollen 0.405
-        debt_equity = (de_raw / 100) if (de_raw and de_raw > 2) else (de_raw or 0)
-        
-        # 52-Wochen-Hoch & Korrektur
-        ath_52w = info.get('fiftyTwoWeekHigh') or hist['High'].max()
-        correction = ((price / ath_52w) - 1) * 100
-        
-        # Trend (SMA 200)
-        sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
+        price = info.get('currentPrice')
+        de = info.get('debtToEquity', 0)
+        debt_ratio = de / 100 if de > 2 else de
         
         return {
-            "Ticker": ticker,
             "Kurs": round(price, 2),
             "KGV": info.get('trailingPE', "N/A"),
-            "Schulden_Quote": round(debt_equity, 3),
-            "Korrektur_%": round(correction, 2),
-            "Trend": "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️"
+            "Schulden_Quote": round(debt_ratio, 3),
+            "Trend": "Aufwärts ✅" if price > (stock.history(period="200d")['Close'].mean()) else "Abwärts ⚠️"
         }
     except:
         return None
 
-# --- UI: NEUEN TICKER HINZUFÜGEN ---
-with st.expander("➕ Neuen Ticker hinzufügen"):
-    new_ticker = st.text_input("Ticker Symbol (z.B. SAP.DE, AMZN):").upper()
-    if st.button("Hinzufügen"):
-        if new_ticker and new_ticker not in st.session_state.ticker_liste:
-            st.session_state.ticker_liste.append(new_ticker)
-            st.rerun()
+# --- UI ---
+st.title("🚀 Watchlist via Supabase")
 
-# --- HAUPTPROGRAMM ---
-if st.session_state.ticker_liste:
-    results = []
-    
-    # Analyse der Ticker
-    for symbol in st.session_state.ticker_liste:
-        with st.spinner(f"Lade {symbol}..."):
-            m = get_stock_metrics(symbol)
-            if m:
-                results.append(m)
-    
-    if results:
-        df_final = pd.DataFrame(results)
-        
-        # --- STYLING ---
-        def highlight_debt(row):
-            # Grün markieren, wenn Schulden < 60%
-            color = 'background-color: rgba(0, 255, 0, 0.1)' if row['Schulden_Quote'] < 0.6 else ''
-            return [color] * len(row)
+data = load_data()
 
-        st.subheader("Aktuelle Analyse")
-        st.dataframe(
-            df_final.style.apply(highlight_debt, axis=1),
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # Mobile-Optimierte Ansicht (Karten-Layout)
-        st.write("---")
-        st.subheader("Mobile Schnellansicht")
-        for res in results:
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.metric(res['Ticker'], f"{res['Kurs']} €", f"{res['Korrektur_%']}%")
-            with col2:
-                status = "✅ STARK" if res['Schulden_Quote'] < 0.6 else "⚠️ HOCH"
-                st.write(f"Schulden: {res['Schulden_Quote']} ({status})")
-                st.write(f"Trend: {res['Trend']}")
-            st.divider()
-    else:
-        st.warning("Konnte keine Daten abrufen.")
+if not data.empty:
+    all_results = []
+    for _, row in data.iterrows():
+        ticker = row['ticker']
+        with st.spinner(f"Lade {ticker}..."):
+            metrics = get_metrics(ticker)
+            if metrics:
+                all_results.append({**row, **metrics})
+    
+    df_final = pd.DataFrame(all_results)
+    
+    # Styling
+    st.dataframe(df_final.style.format(subset=["Schulden_Quote"], formatter="{:.2f}"), use_container_width=True)
+
+# --- NEUEN TICKER HINZUFÜGEN ---
+with st.sidebar:
+    st.header("Verwaltung")
+    new_t = st.text_input("Neuer Ticker").upper()
+    if st.button("Speichern"):
+        supabase.table("watchlist").insert({"ticker": new_t}).execute()
+        st.success(f"{new_t} gespeichert!")
+        st.rerun()
