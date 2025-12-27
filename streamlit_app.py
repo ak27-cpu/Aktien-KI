@@ -2,124 +2,169 @@ import streamlit as st
 from supabase import create_client, Client
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import google.generativeai as genai
 
-# --- 1. KONFIGURATION & SETUP ---
-st.set_page_config(page_title="KI Aktien-Terminal", layout="wide")
+# --- 1. SETUP & KONFIGURATION ---
+st.set_page_config(page_title="KI Aktien-Terminal Pro", layout="wide", initial_sidebar_state="collapsed")
 
-# KI Setup
-# --- KI SETUP (AKTUALISIERT) ---
+# KI Setup mit dem neuen Modellpfad
 if "gemini_key" in st.secrets:
     genai.configure(api_key=st.secrets["gemini_key"])
-    # Wir nutzen das neueste Modell aus deiner Liste
+    # Dein verifizierter Modellpfad aus dem Test
     ki_model = genai.GenerativeModel('models/gemini-2.5-flash')
 else:
     st.error("Gemini API Key fehlt in den Secrets!")
+    st.stop()
 
-def ask_ki(prompt):
-    try:
-        # Sicherheits-Check: Falls das Modell eine Antwort verweigert
-        response = ki_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"KI-Fehler: {str(e)}. Versuche es in einem Moment erneut."
-
-# Supabase Setup
+# Supabase Verbindung
 @st.cache_resource
 def get_supabase():
     return create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 
 supabase = get_supabase()
-# --- DEBUG: WELCHE MODELLE SIND VERFÜGBAR? ---
-with st.expander("🛠️ KI-System-Check (Nur bei Fehlern nutzen)"):
-    if st.button("Verfügbare Modelle auflisten"):
-        try:
-            available_models = genai.list_models()
-            models_list = [m.name for m in available_models if 'generateContent' in m.supported_generation_methods]
-            st.write("Dein Key unterstützt folgende Modelle:")
-            st.json(models_list)
-        except Exception as e:
-            st.error(f"Fehler beim Abrufen der Modelle: {e}")
 
-# --- 2. FUNKTIONEN ---
-def load_watchlist():
-    res = supabase.table("watchlist").select("*").execute()
-    return pd.DataFrame(res.data)
-
-@st.cache_data(ttl=3600)
-def get_live_data(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="2y")
-        price = info.get('currentPrice') or hist['Close'].iloc[-1]
-        sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
-        return {
-            "Kurs": round(price, 2),
-            "Schulden_Quote": round(info.get('debtToEquity', 0) / 100 if info.get('debtToEquity', 0) > 2 else info.get('debtToEquity', 0), 2),
-            "Trend": "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️",
-            "KGV": info.get('trailingPE', 'N/A')
-        }
-    except: return None
+# --- 2. HILFSFUNKTIONEN ---
 
 def ask_ki(prompt):
     try:
         response = ki_model.generate_content(prompt)
         return response.text
-    except Exception as e: return f"Fehler: {e}"
+    except Exception as e:
+        return f"KI-Fehler: {e}"
 
-# --- 3. HAUPT-UI ---
-st.title("🚀 Mein KI-Aktien-Terminal")
+@st.cache_data(ttl=3600)
+def get_pro_metrics(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="2y")
+        if hist.empty: return None
+        
+        info = stock.info
+        curr = info.get('currentPrice') or hist['Close'].iloc[-1]
+        
+        # Korrekturanalyse
+        high_52w = hist['High'].tail(252).max()
+        aktuelle_korr = ((curr / high_52w) - 1) * 100
+        
+        # Historische Korrektur (Durchschnittlicher Drawdown)
+        roll_max = hist['Close'].cummax()
+        drawdowns = (hist['Close'] / roll_max - 1) * 100
+        avg_drawdown = drawdowns.mean()
+        
+        # RSI (14 Tage)
+        delta = hist['Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs)).iloc[-1]
+        
+        # Schulden (Normalisierung auf Prozent)
+        d2e = info.get('debtToEquity')
+        debt_val = 0
+        if d2e:
+            debt_val = d2e if d2e > 5 else d2e * 100
 
-# Sidebar: Verwaltung
-with st.sidebar:
-    st.header("➕ Watchlist")
-    t_input = st.text_input("Ticker").upper()
-    fv_input = st.number_input("Fair Value", value=0.0)
-    if st.button("Hinzufügen"):
-        supabase.table("watchlist").insert({"ticker": t_input, "fair_value": fv_input}).execute()
-        st.rerun()
+        return {
+            "Preis": round(curr, 2),
+            "Korr_%": round(aktuelle_korr, 1),
+            "Hist_Korr_%": round(avg_drawdown, 1),
+            "Schulden_%": round(debt_val, 1),
+            "RSI": round(rsi, 1),
+            "Trend": "Aufwärts ✅" if curr > hist['Close'].rolling(200).mean().iloc[-1] else "Abwärts ⚠️"
+        }
+    except: return None
 
-# Daten laden
-df_db = load_watchlist()
+# --- 3. DATEN LADEN & VERARBEITEN ---
+
+res = supabase.table("watchlist").select("*").execute()
+df_db = pd.DataFrame(res.data)
+
+st.title("🚀 KI Aktien-Terminal Pro")
 
 if not df_db.empty:
-    # Live-Daten mischen
-    with st.spinner("Lade Marktdaten..."):
-        all_data = []
+    all_data = []
+    with st.spinner("Analysiere Marktdaten & Technik..."):
         for _, row in df_db.iterrows():
-            live = get_live_data(row['ticker'])
-            if live: all_data.append({**row, **live})
-    
+            m = get_pro_metrics(row['ticker'])
+            if m:
+                # Schnell-Check Logik
+                abstand_fv = ((m['Preis'] / row['fair_value']) - 1) * 100 if row['fair_value'] > 0 else 0
+                
+                # KI-Kurzurteil für die Tabelle
+                kurz_prompt = f"Aktie {row['ticker']}: Kurs {m['Preis']}, RSI {m['RSI']}, Schulden {m['Schulden_%']}%. Urteil (2 Wörter)."
+                ki_status = ask_ki(kurz_prompt)
+                
+                all_data.append({
+                    "Ticker": row['ticker'],
+                    "Kurs": m['Preis'],
+                    "FairV": row['fair_value'],
+                    "Diff_%": round(abstand_fv, 1),
+                    "Korr_%": m['Korr_%'],
+                    "Ø_Korr": m['Hist_Korr_%'],
+                    "Schulden_%": m['Schulden_%'],
+                    "RSI": m['RSI'],
+                    "KI_Check": ki_status
+                })
+
     df_final = pd.DataFrame(all_data)
-    st.dataframe(df_final, use_container_width=True, hide_index=True)
+
+    # --- TABELLEN ANZEIGE ---
+    st.subheader("📊 Deine Power-Watchlist")
+    
+    def color_values(val):
+        if isinstance(val, (int, float)):
+            if val < 35: return 'color: #00ff00; font-weight: bold' # RSI Kaufsignal
+            if val > 65: return 'color: #ff4b4b' # RSI Warnung
+        return ''
+
+    st.dataframe(
+        df_final.style.map(color_values, subset=['RSI']),
+        use_container_width=True, hide_index=True
+    )
 
     st.divider()
 
-    # --- KI ANALYSE BEREICH ---
-    st.subheader("🤖 KI Analysten-Terminal")
+    # --- 4. EXPERTEN KI-TERMINAL ---
+    st.subheader("🤖 Deep-Dive KI Analyse")
     
-    sel_ticker = st.selectbox("Aktie wählen:", df_final['ticker'])
-    modus = st.radio("Analyse-Typ:", [
-        "Komplett-Analyse", "Bewertungs-Profi", "Dividenden-Check", 
-        "Konkurrenz-Vergleich", "Crash-Analyse", "Portfolio-Check"
-    ], horizontal=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        sel_ticker = st.selectbox("Aktie wählen", df_final['Ticker'])
+    with col2:
+        modus = st.selectbox("Analyse-Modus", [
+            "Komplett-Analyse (Equity Report)",
+            "Bewertungs-Profi (DCF + Multiples)",
+            "Dividenden-Sicherheitscheck",
+            "Konkurrenz- & Marktvergleich",
+            "Crash- & Rezessionsanalyse",
+            "Portfolio-Optimierungs-Check"
+        ])
 
-    # Hier greift dein Experten-Regelwerk
-    if st.button(f"Analyse für {sel_ticker} starten"):
-        stock_info = df_final[df_final['ticker'] == sel_ticker].iloc[0].to_dict()
+    if st.button(f"Starte {modus}"):
+        stock_info = df_final[df_final['Ticker'] == sel_ticker].iloc[0].to_dict()
         
+        # Deine spezifischen Anweisungen
         prompts = {
-            "Komplett-Analyse": f"Analysiere {sel_ticker} wie ein Profi-Equity-Analyst: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanz, 5. Dividende, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Daten: {stock_info}",
-            "Bewertungs-Profi": f"Berechne fairen Wert für {sel_ticker} via DCF, Multiples & Branchenvergleich. Daten: {stock_info}",
-            "Dividenden-Check": f"Prüfe Dividendenqualität von {sel_ticker}: Quote, Historie, Sicherheit. Urteil: sicher, fraglich, riskant.",
-            "Konkurrenz-Vergleich": f"Vergleiche {sel_ticker} mit 3 Konkurrenten (Wachstum, Margen, Burggraben). Erstelle Ranking.",
-            "Crash-Analyse": f"Historisches Verhalten von {sel_ticker} in Krisen. Stabilität 1-10.",
-            "Portfolio-Check": f"Bewerte mein Portfolio: {df_final['ticker'].tolist()}. Fokus auf Klumpenrisiken & Optimierung."
+            "Komplett-Analyse (Equity Report)": f"Erstelle eine vollständige Analyse für {sel_ticker}. Struktur: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanzqualität, 5. Dividenden, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Daten: {stock_info}",
+            "Bewertungs-Profi (DCF + Multiples)": f"Berechne fairen Wert für {sel_ticker} (DCF + Multiples). Price Range und Annahmen angeben. Daten: {stock_info}",
+            "Dividenden-Sicherheitscheck": f"Prüfe Dividendenqualität von {sel_ticker}: Ausschüttung (EPS/FCF), Historie, Sicherheit. Urteil: sicher/fraglich/riskant.",
+            "Konkurrenz- & Marktvergleich": f"Vergleiche {sel_ticker} mit 3 Top-Konkurrenten (Margen, Wachstum, Burggraben). Erstelle Ranking.",
+            "Crash- & Rezessionsanalyse": f"Wie reagiert {sel_ticker} auf Krisen? Stabilität (1-10), Cashflow-Resistenz.",
+            "Portfolio-Optimierungs-Check": f"Bewerte mein Portfolio: {df_final['Ticker'].tolist()}. Diversifikation und Klumpenrisiken prüfen."
         }
-        
+
         with st.chat_message("assistant"):
-            bericht = ask_ki(prompts[modus])
-            st.markdown(bericht)
+            st.markdown(ask_ki(prompts[modus]))
+
 else:
-    st.info("Noch keine Ticker in der Datenbank.")
+    st.info("Füge Ticker in deine Supabase-Datenbank ein.")
+
+# --- SIDEBAR: VERWALTUNG ---
+with st.sidebar:
+    st.header("⚙️ Verwaltung")
+    new_ticker = st.text_input("Neuer Ticker (z.B. AAPL)").upper()
+    new_fv = st.number_input("Fairer Wert (€)", value=100.0)
+    if st.button("Hinzufügen"):
+        supabase.table("watchlist").insert({"ticker": new_ticker, "fair_value": new_fv}).execute()
+        st.rerun()
