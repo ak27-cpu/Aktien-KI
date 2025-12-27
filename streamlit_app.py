@@ -46,88 +46,19 @@ def load_watchlist():
     res = supabase.table("watchlist").select("*").execute()
     return pd.DataFrame(res.data)
 
-import numpy as np
-
 @st.cache_data(ttl=3600)
-def get_extended_metrics(ticker):
+def get_live_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="2y") # 2 Jahre für stabilere Durchschnitte
         info = stock.info
-        
-        if hist.empty: return None
-
-        # 1. Kurs & Allzeithoch (52W)
-        current_price = info.get('currentPrice') or hist['Close'].iloc[-1]
-        high_52w = info.get('fiftyTwoWeekHigh') or hist['High'].max()
-        aktuelle_korrektur = ((current_price / high_52w) - 1) * 100
-        
-        # 2. Historische Korrektur (Durchschnittliche Drawdowns)
-        # Wir berechnen den Schnitt der Abstände vom rollierenden Hoch
-        rolling_max = hist['Close'].cummax()
-        drawdowns = (hist['Close'] / rolling_max - 1) * 100
-        hist_korrektur_schnitt = drawdowns.mean()
-
-        # 3. RSI (Relative Strength Index) - 14 Tage
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1+rs)).iloc[-1]
-
-        # 4. Verschuldungsgrad (Total Debt / Equity)
-        debt_to_equity = info.get('debtToEquity', 0) 
-        # yfinance liefert oft Werte wie 80.0 für 80%
-        verschuldungsgrad = debt_to_equity if debt_to_equity < 5 else debt_to_equity / 100
-
+        hist = stock.history(period="2y")
+        price = info.get('currentPrice') or hist['Close'].iloc[-1]
+        sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
         return {
-            "Kurs": round(current_price, 2),
-            "Korrektur_%": round(aktuelle_korrektur, 1),
-            "Hist_Korrektur_%": round(hist_korrektur_schnitt, 1),
-            "Schulden_%": round(verschuldungsgrad * 100, 1),
-            "RSI": round(rsi, 1),
-            "Trend": "Aufwärts ✅" if current_price > hist['Close'].rolling(200).mean().iloc[-1] else "Abwärts ⚠️"
-        }
-    except Exception as e:
-        return None
-
-# --- UI DARSTELLUNG ---
-df_db = load_watchlist()
-if not df_db.empty:
-    all_results = []
-    for _, row in df_db.iterrows():
-        m = get_extended_metrics(row['ticker'])
-        if m:
-            # KI-Quick-Check (Kurze Einschätzung für die Tabelle)
-            # Wir geben der KI nur die nackten Zahlen für ein schnelles Urteil
-            abstand_fv = ((m['Kurs'] / row['fair_value']) - 1) * 100 if row['fair_value'] > 0 else 0
-            
-            # Kurzes KI Urteil generieren (Optional für jede Zeile)
-            status_prompt = f"Aktie {row['ticker']}: Kurs {m['Kurs']}, FairValue {row['fair_value']}, RSI {m['RSI']}, Schulden {m['Schulden_%']}%. Urteil in 2 Worten (z.B. 'Günstig, Kaufen' oder 'Teuer, Warten')."
-            ki_kurzurteil = ask_ki(status_prompt)
-            
-            all_results.append({
-                "Ticker": row['ticker'],
-                "Preis": f"{m['Kurs']} €",
-                "Fair Value": f"{row['fair_value']} €",
-                "Abstand FV": f"{round(abstand_fv, 1)}%",
-                "Korrektur": f"{m['Korrektur_%']}%",
-                "Ø Korr.": f"{m['Hist_Korrektur_%']}%",
-                "Schulden": f"{m['Schulden_%']}%",
-                "RSI": m['RSI'],
-                "KI-Check": ki_kurzurteil
-            })
-
-    df_power = pd.DataFrame(all_results)
-    
-    # Styling für die Tabelle
-    def style_rsi(v):
-        if v < 30: return 'background-color: #00ff00; color: black' # Überverkauft
-        if v > 70: return 'background-color: #ff4b4b; color: white' # Überkauft
-        return ''
-
-    st.subheader("🚀 Power-Watchlist")
-    st.dataframe(df_power.style.applymap(style_rsi, subset=['RSI']), use_container_width=True, hide_index=True)
+            "Kurs": round(price, 2),
+            "Schulden_Quote": round(info.get('debtToEquity', 0) / 100 if info.get('debtToEquity', 0) > 2 else info.get('debtToEquity', 0), 2),
+            "Trend": "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️",
+            "KGV": info.get('trailingPE', 'N/A')
         }
     except: return None
 
