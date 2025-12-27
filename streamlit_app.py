@@ -5,162 +5,142 @@ import pandas as pd
 import numpy as np
 import google.generativeai as genai
 
-# --- 1. SETUP ---
+# --- 1. SETUP & KONFIGURATION ---
 st.set_page_config(page_title="Investment Terminal 2025", layout="wide")
 
-if "gemini_key" in st.secrets:
+# API Keys aus st.secrets laden
+try:
+    supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
     genai.configure(api_key=st.secrets["gemini_key"])
-    ki_model = genai.GenerativeModel('models/gemini-2.5-flash')
-else:
-    st.error("API Key fehlt!")
+    ki_model = genai.GenerativeModel('models/gemini-2.0-flash') # Aktuelles Gemini Modell
+except Exception as e:
+    st.error(f"Setup Fehler: {e}")
     st.stop()
 
-supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
-
-# --- 2. HILFSFUNKTIONEN ---
-
-def ask_ki(prompt):
+# --- 2. MARKT-INDIKATOREN FUNKTION ---
+def get_market_indicators():
     try:
-        return ki_model.generate_content(prompt).text
-    except: return "KI Fehler"
+        # VIX Index
+        vix = yf.Ticker("^VIX")
+        vix_val = vix.history(period="1d")['Close'].iloc[-1]
+        
+        # S&P 500 für Fear & Greed Proxy (Abstand zur 125-Tage-Linie)
+        spy = yf.Ticker("^GSPC")
+        spy_hist = spy.history(period="150d")
+        cp = spy_hist['Close'].iloc[-1]
+        sma125 = spy_hist['Close'].rolling(125).mean().iloc[-1]
+        fg_score = int((cp / sma125) * 50)
+        if fg_score > 100: fg_score = 100
+        
+        return round(vix_val, 2), fg_score
+    except:
+        return 20.0, 50
 
-@st.cache_data(ttl=3600)
-def get_metrics(ticker):
+@st.cache_data(ttl=1800)
+def get_stock_metrics(ticker):
     try:
         s = yf.Ticker(ticker)
         h = s.history(period="2y")
         if h.empty: return None
-        
-        info = s.info
-        cp = info.get('currentPrice') or h['Close'].iloc[-1]
+        cp = h['Close'].iloc[-1]
         ath = h['High'].max()
         
-        # RSI Berechnung
+        # RSI 14 Tage
         delta = h['Close'].diff()
         g = delta.where(delta > 0, 0).rolling(window=14).mean()
         l = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rsi = 100 - (100 / (1 + (g/l))).iloc[-1]
         
-        return {
-            "Preis": round(cp, 2), 
-            "ATH": round(ath, 2),
-            "RSI": round(rsi, 1), 
-            "Abstand_ATH": round(((cp / ath) - 1) * 100, 1)
-        }
-    except: return None
+        return {"Preis": round(cp, 2), "ATH": round(ath, 2), "RSI": round(rsi, 1)}
+    except:
+        return None
 
-# --- 3. UI & SIDEBAR ---
-st.title("🏛️ Professional Investment Terminal (ATH, FV & RSI)")
+# --- 3. HEADER: DYNAMISCHE BANNER ---
+vix, fg = get_market_indicators()
 
+st.title("🏛️ Professional Investment Cockpit")
+col_vix, col_fg = st.columns(2)
+
+with col_vix:
+    if vix < 20:
+        st.success(f"📉 VIX: {vix} (Niedrige Volatilität / Ruhe)")
+    elif 20 <= vix < 30:
+        st.warning(f"⚠️ VIX: {vix} (Erhöhte Nervosität)")
+    else:
+        st.error(f"🚨 VIX: {vix} (PANIK-MODUS)")
+
+with col_fg:
+    if fg < 35:
+        st.success(f"😱 Fear & Greed: {fg}/100 (Angst = KAUFCHANCE)")
+    elif 35 <= fg < 70:
+        st.info(f"⚖️ Fear & Greed: {fg}/100 (Neutral)")
+    else:
+        st.error(f"🔥 Fear & Greed: {fg}/100 (Gier = VORSICHT)")
+
+st.divider()
+
+# --- 4. SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Tranchen-Parameter")
-    t1_drop = st.slider("Tranche 1 bei ATH-Korrektur (%)", 5, 50, 15)
-    t2_drop = st.slider("Tranche 2 bei ATH-Korrektur (%)", 10, 70, 30)
+    st.header("⚙️ Strategie-Parameter")
+    t1_drop = st.slider("Tranche 1 bei ATH-Korrektur %", 5, 50, 15)
+    t2_drop = st.slider("Tranche 2 bei ATH-Korrektur %", 10, 70, 30)
+    rsi_limit = st.slider("Max. RSI für Kauffreigabe", 20, 70, 45)
     
     st.divider()
-    st.header("🛡️ RSI-Filter")
-    max_rsi_kauf = st.slider("Max. RSI für Kauffreigabe", 20, 70, 45, help="Nur wenn der RSI unter diesem Wert liegt, wird ein Kaufsignal (🎯) angezeigt.")
-    
-    st.divider()
-    st.header("➕ Neue Aktie")
-    t_in = st.text_input("Ticker Symbol").upper()
-    fv_in = st.number_input("Fairer Wert (€)", value=0.0)
-    if st.button("Speichern"):
-        if t_in:
-            supabase.table("watchlist").insert({"ticker": t_in, "fair_value": fv_in}).execute()
-            st.rerun()
+    if st.button("🔄 Marktdaten aktualisieren"):
+        st.cache_data.clear()
+        st.rerun()
 
-# --- 4. DATENVERARBEITUNG ---
+# --- 5. HAUPT-LOGIK (WATCHLIST) ---
 res = supabase.table("watchlist").select("*").execute()
 df_db = pd.DataFrame(res.data)
 
 if not df_db.empty:
     rows = []
-    with st.spinner("Lade Marktdaten..."):
+    with st.spinner("Lade Live-Daten..."):
         for _, r in df_db.iterrows():
-            m = get_metrics(r['ticker'])
+            m = get_stock_metrics(r['ticker'])
             if m:
                 fv = r.get('fair_value', 0) or 0
-                t1_preis = m['ATH'] * (1 - t1_drop/100)
-                t2_preis = m['ATH'] * (1 - t2_drop/100)
-                diff_fv = ((m['Preis'] / fv) - 1) * 100 if fv > 0 else 0
+                t1_p = m['ATH'] * (1 - t1_drop/100)
+                t2_p = m['ATH'] * (1 - t2_drop/100)
                 
-                # KOMPLEXE SIGNAL-LOGIK (Preis + RSI)
+                # Signal Logik
                 status = "⏳ Warten"
-                if m['Preis'] <= t1_preis:
-                    if m['RSI'] <= max_rsi_kauf:
-                        status = "🎯 TR1 BEREIT"
-                    else:
-                        status = "⚠️ Preis OK, RSI zu hoch"
-                
-                if m['Preis'] <= t2_preis:
-                    if m['RSI'] <= max_rsi_kauf:
-                        status = "🔥 TR2 LIMIT"
-                    else:
-                        status = "⚠️ TR2 Preis erreicht, RSI hoch"
+                if m['Preis'] <= t1_p:
+                    status = "🎯 TR1 BEREIT" if m['RSI'] <= rsi_limit else "⚠️ RSI HOCH"
+                if m['Preis'] <= t2_p:
+                    status = "🔥 TR2 LIMIT" if m['RSI'] <= rsi_limit else "⚠️ RSI HOCH"
 
                 rows.append({
-                    "id": r['id'],
                     "Ticker": r['ticker'],
                     "Kurs": m['Preis'],
                     "Fair Value": fv,
-                    "Diff_FV %": round(diff_fv, 1),
-                    "Korr_ATH %": m['Abstand_ATH'],
                     "RSI": m['RSI'],
-                    "Tranche 1": round(t1_preis, 2),
-                    "Tranche 2": round(t2_preis, 2),
-                    "Status": status
+                    "ATH": m['ATH'],
+                    "Korr/ATH %": round(((m['Preis']/m['ATH'])-1)*100, 1),
+                    "Status": status,
+                    "Notiz": r.get('notiz', "")
                 })
 
-    df_display = pd.DataFrame(rows)
+    df_final = pd.DataFrame(rows)
 
-    # --- TABELLEN STYLING (HEATMAP) ---
-    def style_rows(row):
-        styles = [''] * len(row)
-        if "🎯" in str(row['Status']) or "🔥" in str(row['Status']):
-            styles = ['background-color: #004d00'] * len(row) # Dunkelgrün für Kaufzone
-        elif "⚠️" in str(row['Status']):
-            styles = ['background-color: #4d4d00'] * len(row) # Dunkelgelb für RSI-Warnung
-        return styles
+    # Tabelle Styling
+    def style_status(val):
+        if "🎯" in val: return 'background-color: #004d00; color: white'
+        if "🔥" in val: return 'background-color: #800000; color: white'
+        if "⚠️" in val: return 'background-color: #4d4d00; color: white'
+        return ''
 
-    st.subheader("📊 Multi-Faktor Watchlist & Heatmap")
-    
-    st.data_editor(
-        df_display.style.apply(style_rows, axis=1),
-        column_config={
-            "id": None,
-            "RSI": st.column_config.NumberColumn("RSI", help="Grün < 35, Rot > 65"),
-            "Diff_FV %": st.column_config.NumberColumn("Abstand FV %", format="%.1f%%"),
-            "Status": st.column_config.TextColumn("Handlungsempfehlung")
-        },
-        disabled=list(df_display.columns), # Deaktiviert Bearbeitung in der Ansicht für Stabilität
-        hide_index=True,
-        use_container_width=True
-    )
+    st.subheader("📊 Deine Watchlist (Live)")
+    st.dataframe(df_final.style.applymap(style_status, subset=['Status']), use_container_width=True, hide_index=True)
 
-    # Lösch-Funktion & FV-Update in separaten Bereich für besseres UI
-    col_up, col_del = st.columns(2)
-    with col_up:
-        with st.expander("📝 Fair Value manuell anpassen"):
-            up_ticker = st.selectbox("Ticker wählen", df_display['Ticker'])
-            new_fv = st.number_input("Neuer Wert", value=0.0)
-            if st.button("Update"):
-                supabase.table("watchlist").update({"fair_value": new_fv}).eq("ticker", up_ticker).execute()
-                st.rerun()
-    
-    with col_del:
-        with st.expander("🗑️ Ticker entfernen"):
-            del_t = st.selectbox("Ticker löschen", df_display['Ticker'])
-            if st.button("Löschen"):
-                supabase.table("watchlist").delete().eq("ticker", del_t).execute()
-                st.rerun()
-
-    # --- 5. EXPERTEN ANALYSE ---
+    # --- 6. ERWEITERTE KI ANALYSE ---
     st.divider()
-    st.subheader("🤖 KI Analyse-Terminal")
-    sel_ticker = st.selectbox("Aktie für Tiefenprüfung:", df_display['Ticker'], key="deepdive")
+    st.subheader("🤖 Experten-Analyse-Terminal")
     
-    analyse_typ = st.selectbox("Analyse-Prozess wählen:", [
+    sel_ticker = st.selectbox("Aktie für Tiefenprüfung wählen:", df_final['Ticker'])
+    analyse_typ = st.selectbox("Analyse-Prozess starten:", [
         "1. Komplett-Analyse (Equity Report)",
         "2. Bewertungs-Profi (Fair Value Kalkulation)",
         "3. Dividenden-Sicherheits-Check",
@@ -169,21 +149,20 @@ if not df_db.empty:
         "6. Szenario-Analyse (Best/Worst Case)"
     ])
 
-    if st.button("KI Prozess starten"):
-        stock_context = df_display[df_display['Ticker'] == sel_ticker].iloc[0].to_dict()
+    if st.button("Prozess ausführen"):
+        ctx = df_final[df_final['Ticker'] == sel_ticker].iloc[0].to_dict()
         
-        # Hier habe ich deine spezifischen Analyse-Anweisungen eingebaut
         prompts = {
-            "1. Komplett-Analyse (Equity Report)": f"Analysiere {sel_ticker} wie ein Profi: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanz, 5. Dividende, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Kontext: {stock_context}",
-            "2. Bewertungs-Profi (Fair Value Kalkulation)": f"Berechne für {sel_ticker} einen fairen Wert aus DCF & KGV. Nutze den aktuellen RSI von {stock_context['RSI']} für das Timing. Kontext: {stock_context}",
-            "3. Dividenden-Sicherheits-Check": f"Untersuche die Dividende von {sel_ticker}: Payout-Ratio, Historie & Sicherheit. Kontext: {stock_context}",
-            "4. Konkurrenz-Ranking (Market Share)": f"Vergleiche {sel_ticker} mit den Top-Wettbewerbern. Margen- & Burggraben-Check.",
-            "5. Crash-Resistenz-Test": f"Wie hat sich {sel_ticker} historisch in Bärenmärkten verhalten? Drawdowns & Recovery.",
-            "6. Szenario-Analyse (Best/Worst Case)": f"Erstelle 3 Kurs-Szenarien auf 24 Monate für {sel_ticker}."
+            "1. Komplett-Analyse (Equity Report)": f"Analysiere {sel_ticker} wie ein Profi: Geschäftsmodell, Fundamentaldaten, Moat, Risiko. Marktstimmung: VIX {vix}, F&G {fg}. Kontext: {ctx}",
+            "2. Bewertungs-Profi (Fair Value Kalkulation)": f"Berechne für {sel_ticker} einen fairen Wert aus DCF & KGV. Nutze RSI {ctx['RSI']} für Timing-Einschätzung. Kontext: {ctx}",
+            "3. Dividenden-Sicherheits-Check": f"Untersuche Dividende von {sel_ticker}: Payout, Historie & Sicherheit. Kontext: {ctx}",
+            "4. Konkurrenz-Ranking (Market Share)": f"Vergleiche {sel_ticker} mit Top-Wettbewerbern. Wer hat die besten Margen?",
+            "5. Crash-Resistenz-Test": f"Wie hat sich {sel_ticker} historisch in Bärenmärkten verhalten? Daten: {ctx}",
+            "6. Szenario-Analyse (Best/Worst Case)": f"Erstelle 3 Kurs-Szenarien für {sel_ticker} auf Sicht von 24 Monaten."
         }
         
         with st.chat_message("assistant"):
-            st.markdown(ask_ki(prompts[analyse_typ]))
+            st.markdown(ki_model.generate_content(prompts[analyse_typ]).text)
 
 else:
-    st.info("Watchlist ist leer.")
+    st.info("Watchlist leer. Nutze den Supabase Table Editor zum Hinzufügen von Tickersymbolen.")
