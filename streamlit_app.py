@@ -80,6 +80,7 @@ with st.sidebar:
                 st.error("Fehler (Ticker schon vorhanden?)")
 
 # Hauptinhalt
+# --- BERECHNUNGEN & UI ERWEITERUNG ---
 df_db = load_watchlist()
 
 if not df_db.empty:
@@ -88,36 +89,62 @@ if not df_db.empty:
         with st.spinner(f"Analysiere {row['ticker']}..."):
             live = get_live_metrics(row['ticker'])
             if live:
-                # Kombiniere DB-Daten mit Live-Daten
-                results.append({**row, **live})
+                # 1. Berechnung: Abstand zum Fairen Wert
+                fv = row.get('fair_value', 0)
+                diff_to_fv = ((live['Live_Kurs'] / fv) - 1) * 100 if fv > 0 else 0
+                
+                # Alles zusammenfügen
+                results.append({
+                    **row, 
+                    **live, 
+                    "Abstand_FV_%": round(diff_to_fv, 1)
+                })
 
     if results:
         df_final = pd.DataFrame(results)
         
-        # Spalten sortieren für bessere Ansicht
-        cols = ["ticker", "Live_Kurs", "fair_value", "Schulden_Quote", "Korrektur_%", "Trend"]
-        df_display = df_final[cols]
+        # --- METRIKEN OBEN (Zusammenfassung) ---
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Aktien in Watchlist", len(df_final))
+        # Zähle wie viele im Aufwärtstrend sind
+        uptrend_count = df_final[df_final['Trend'].str.contains("Aufwärts")].shape[0]
+        c2.metric("Im Aufwärtstrend", f"{uptrend_count}")
+        # Günstigste Aktie finden
+        top_pick = df_final.loc[df_final['Abstand_FV_%'].idxmin()]
+        c3.metric("Top Pick (FV)", top_pick['ticker'], f"{top_pick['Abstand_FV_%']}%")
 
-        # Styling
-        def style_rows(row):
-            # Grün markieren wenn Schulden < 60% UND Kurs unter Fairem Wert
-            color = ''
-            if row['Schulden_Quote'] < 0.6:
-                color = 'background-color: rgba(0, 255, 0, 0.1)'
-            return [color] * len(row)
+        # --- TABELLEN-STYLING ---
+        st.subheader("Detail-Analyse")
+        
+        def color_logic(val):
+            if isinstance(val, (int, float)):
+                if val < 0: return 'color: #00ff00; font-weight: bold' # Unter Fair Value = Grün
+                if val > 20: return 'color: #ff4b4b' # Weit über Fair Value = Rot
+            return ''
 
         st.dataframe(
-            df_display.style.apply(style_rows, axis=1).format({"Schulden_Quote": "{:.2f}", "Live_Kurs": "{:.2f} €"}),
+            df_final.style.applymap(color_logic, subset=['Abstand_FV_%'])
+            .format({
+                "Schulden_Quote": "{:.2f}", 
+                "Live_Kurs": "{:.2f} €", 
+                "Abstand_FV_%": "{:+.1f}%"
+            }),
             use_container_width=True,
             hide_index=True
         )
 
-        # Lösch-Bereich
-        with st.expander("🗑️ Aktie entfernen"):
-            to_delete = st.selectbox("Ticker wählen", df_final['ticker'])
-            id_to_del = df_final[df_final['ticker'] == to_delete]['id'].values[0]
-            if st.button("Endgültig löschen"):
-                delete_ticker(id_to_del)
-                st.rerun()
-else:
-    st.info("Deine Datenbank ist noch leer. Füge links einen Ticker hinzu.")
+        # --- MOBILE KARTEN (Extra für das iPhone) ---
+        st.write("### 📱 Mobile Check")
+        for _, stock in df_final.iterrows():
+            with st.container():
+                col_a, col_b = st.columns([2, 1])
+                with col_a:
+                    st.markdown(f"**{stock['ticker']}** | {stock['sector'] or 'Diverse'}")
+                    st.markdown(f"Kurs: {stock['Live_Kurs']} € (Ziel: {stock['fair_value']} €)")
+                with col_b:
+                    # Kleiner visueller Marker für den Kaufpreis
+                    if stock['Abstand_FV_%'] <= 0:
+                        st.success("KAUFZONE")
+                    else:
+                        st.warning(f"+{stock['Abstand_FV_%']}%")
+                st.divider()
