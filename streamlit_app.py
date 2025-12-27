@@ -5,9 +5,10 @@ import pandas as pd
 import numpy as np
 import google.generativeai as genai
 
-# --- 1. SETUP ---
+# --- 1. SETUP & KONFIGURATION ---
 st.set_page_config(page_title="Investment Terminal 2025", layout="wide")
 
+# KI Setup
 if "gemini_key" in st.secrets:
     genai.configure(api_key=st.secrets["gemini_key"])
     ki_model = genai.GenerativeModel('models/gemini-2.5-flash')
@@ -15,34 +16,32 @@ else:
     st.error("API Key fehlt!")
     st.stop()
 
+# Supabase Verbindung
 supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 
 # --- 2. FUNKTIONEN ---
 
 def ask_ki(prompt):
     try:
-        return ki_model.generate_content(prompt).text
-    except: return "KI Fehler"
-
-def get_ki_fair_value(ticker, curr_price):
-    """Generiert einen fairen Wert, falls 0 eingegeben wurde"""
-    prompt = f"Berechne basierend auf aktuellen Marktdaten einen konservativen fairen Wert für die Aktie {ticker}. Aktueller Kurs: {curr_price}. Gib NUR die Zahl als Antwort, ohne Text."
-    res = ask_ki(prompt)
-    try:
-        # Extrahiere nur die Zahl aus der Antwort
-        return float(''.join(c for c in res if c.isdigit() or c == '.'))
-    except: return round(curr_price * 0.9, 2) # Fallback: 10% unter Kurs
+        response = ki_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"KI-Fehler: {e}"
 
 @st.cache_data(ttl=3600)
 def get_metrics(ticker):
     try:
         s = yf.Ticker(ticker)
         h = s.history(period="1y")
+        if h.empty: return None
+        
         info = s.info
         cp = info.get('currentPrice') or h['Close'].iloc[-1]
         
-        # RSI
-        delta = h['Close'].diff(); g = delta.where(delta > 0, 0).rolling(14).mean(); l = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        # RSI Berechnung
+        delta = h['Close'].diff()
+        g = delta.where(delta > 0, 0).rolling(window=14).mean()
+        l = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rsi = 100 - (100 / (1 + (g/l))).iloc[-1]
         
         # Schulden & Korrektur
@@ -50,110 +49,131 @@ def get_metrics(ticker):
         debt = d2e if d2e > 5 else d2e * 100
         korr = ((cp / h['High'].max()) - 1) * 100
         
-        return {"Preis": round(cp, 2), "RSI": round(rsi, 1), "Schulden": round(debt, 1), "Korr": round(korr, 1)}
+        return {
+            "Preis": round(cp, 2), 
+            "RSI": round(rsi, 1), 
+            "Schulden": round(debt, 1), 
+            "Korr": round(korr, 1)
+        }
     except: return None
 
-# --- 3. DATEN & UI ---
+# --- 3. HAUPT-ANWENDUNG ---
 
-st.title("🏛️ Professional Investment Terminal")
+st.title("🏛️ Professional Investment Terminal Pro")
 
-# Daten laden
+# Daten aus Supabase laden
 res = supabase.table("watchlist").select("*").execute()
 df_db = pd.DataFrame(res.data)
 
-# --- SIDEBAR: HINZUFÜGEN & KRITERIEN ---
+# --- SIDEBAR: MANAGEMENT ---
 with st.sidebar:
-    st.header("➕ Neue Aktie")
-    t_in = st.text_input("Ticker").upper()
-    fv_in = st.number_input("Fair Value (0 = KI berechnet)", value=0.0)
-    if st.button("Hinzufügen"):
+    st.header("➕ Aktie hinzufügen")
+    t_in = st.text_input("Ticker Symbol").upper()
+    fv_in = st.number_input("Fair Value (€) - 0 = KI Check", value=0.0)
+    
+    if st.button("Speichern"):
         if t_in:
-            if fv_in == 0:
-                with st.spinner("KI berechnet fairen Wert..."):
-                    m_temp = get_metrics(t_in)
-                    fv_in = get_ki_fair_value(t_in, m_temp['Preis']) if m_temp else 0
-            supabase.table("watchlist").insert({"ticker": t_in, "fair_value": fv_in}).execute()
-            st.success(f"{t_in} hinzugefügt!")
-            st.rerun()
+            with st.spinner(f"Analysiere {t_in}..."):
+                m_temp = get_metrics(t_in)
+                final_fv = fv_in
+                
+                # Automatischer Fair Value via KI
+                if final_fv <= 0 and m_temp:
+                    prompt = f"Berechne basierend auf Kurs {m_temp['Preis']}€ einen fairen Wert für {t_in}. Gib NUR die Zahl zurück."
+                    res_ki = ask_ki(prompt)
+                    try:
+                        cleaned = "".join(filter(lambda x: x.isdigit() or x == '.', res_ki))
+                        final_fv = float(cleaned)
+                    except:
+                        final_fv = m_temp['Preis'] * 0.9
+                
+                supabase.table("watchlist").insert({"ticker": t_in, "fair_value": final_fv}).execute()
+                st.success(f"{t_in} gespeichert.")
+                st.rerun()
 
     st.divider()
-    st.header("⚙️ Kauf-Kriterien")
-    tranchen_spread = st.slider("Tranchen-Abstand (%)", 5, 20, 10)
-    max_rsi = st.slider("Max. RSI für Kauf", 30, 70, 45)
+    st.header("⚙️ Kauf-Parameter")
+    t_spread = st.slider("Abstand Tranche 2 (%)", 5, 25, 12)
+    rsi_limit = st.slider("Max. RSI für Kaufzone", 30, 70, 45)
 
-# --- HAUPTTEIL ---
+# --- 4. DASHBOARD ANZEIGE ---
 if not df_db.empty:
     rows = []
-    for _, r in df_db.iterrows():
-        m = get_metrics(r['ticker'])
-        if m:
-            fv = r['fair_value']
-            abstand = ((m['Preis'] / fv) - 1) * 100
-            
-            # Tranchen Logik
-            t1 = fv
-            t2 = fv * (1 - tranchen_spread/100)
-            status = "🎯 KAUFZONE" if m['Preis'] <= fv and m['RSI'] <= max_rsi else "⏳ Warten"
-            
-            rows.append({
-                "id": r['id'],
-                "Ticker": r['ticker'],
-                "Kurs": m['Preis'],
-                "Fair Value": fv,
-                "Abstand %": round(abstand, 1),
-                "RSI": m['RSI'],
-                "Schulden %": m['Schulden'],
-                "Status": status,
-                "Tranche 1": round(t1, 2),
-                "Tranche 2": round(t2, 2)
-            })
+    with st.spinner("Marktdaten werden aktualisiert..."):
+        for _, r in df_db.iterrows():
+            m = get_metrics(r['ticker'])
+            if m:
+                # Sicherheits-Check für Fair Value
+                fv = r.get('fair_value', 0) or 0
+                abstand = ((m['Preis'] / fv) - 1) * 100 if fv > 0 else 0
+                
+                # Tranchen & Status
+                status = "🎯 KAUFZONE" if fv > 0 and m['Preis'] <= fv and m['RSI'] <= rsi_limit else "⏳ Warten"
+                t2_preis = fv * (1 - t_spread/100) if fv > 0 else 0
+                
+                rows.append({
+                    "id": r['id'],
+                    "Ticker": r['ticker'],
+                    "Kurs": m['Preis'],
+                    "Fair_Value": fv,
+                    "Abstand_%": round(abstand, 1),
+                    "RSI": m['RSI'],
+                    "Schulden_%": m['Schulden'],
+                    "Status": status,
+                    "Tranche_2": round(t2_preis, 2)
+                })
 
     df_display = pd.DataFrame(rows)
 
-    # Editierbare Tabelle
-    st.subheader("📊 Live Portfolio-Monitor")
+    # Editierbare Watchlist
+    st.subheader("📊 Live Markt-Monitor & Tranchen-Planer")
+    
+    # Editor für Fair Value Änderungen
     edited_df = st.data_editor(
-        df_display, 
+        df_display,
         column_config={
-            "id": None, # ID verstecken
-            "Fair Value": st.column_config.NumberColumn(format="%.2f €"),
-            "Status": st.column_config.TextColumn("Empfehlung")
+            "id": None,
+            "Fair_Value": st.column_config.NumberColumn("Fair Value (€)", format="%.2f"),
+            "Status": st.column_config.TextColumn("Signal"),
+            "Tranche_2": st.column_config.NumberColumn("Tranche 2 (€)")
         },
-        disabled=["Ticker", "Kurs", "Abstand %", "RSI", "Schulden %", "Tranche 1", "Tranche 2"],
+        disabled=["Ticker", "Kurs", "Abstand_%", "RSI", "Schulden_%", "Status", "Tranche_2"],
         hide_index=True,
         use_container_width=True
     )
 
-    # Änderungen in Supabase speichern
-    if st.button("Änderungen in Datenbank übernehmen"):
+    # Speichern von Änderungen
+    if st.button("💾 Alle Änderungen permanent speichern"):
         for _, row in edited_df.iterrows():
-            supabase.table("watchlist").update({"fair_value": row["Fair Value"]}).eq("id", row["id"]).execute()
-        st.success("Daten aktualisiert!")
+            supabase.table("watchlist").update({"fair_value": row["Fair_Value"]}).eq("id", row["id"]).execute()
+        st.success("Datenbank aktualisiert!")
         st.rerun()
 
-    # Lösch-Funktion
-    st.divider()
-    del_col1, del_col2 = st.columns([3, 1])
-    with del_col1:
-        to_delete = st.selectbox("Aktie aus Liste entfernen:", df_display['Ticker'])
-    with del_col2:
-        if st.button("🗑️ Löschen"):
-            supabase.table("watchlist").delete().eq("ticker", to_delete).execute()
+    # Löschen Sektion
+    with st.expander("🗑️ Ticker aus Watchlist löschen"):
+        del_ticker = st.selectbox("Wähle Ticker zum Entfernen", df_display['Ticker'])
+        if st.button("Endgültig Löschen"):
+            supabase.table("watchlist").delete().eq("ticker", del_ticker).execute()
             st.rerun()
 
-    # --- KI ANALYSE ---
+    # --- 5. KI DEEP DIVE ---
     st.divider()
-    st.subheader("🤖 KI Fair-Value-Rechner & Deep Dive")
-    sel_ticker = st.selectbox("Aktie für detaillierte Analyse wählen:", df_display['Ticker'])
+    st.subheader("🤖 Experten-Analyse & Fair Value Kalkulator")
     
-    if st.button("Deep Dive & Fair Value Check starten"):
-        stock_data = df_display[df_display['Ticker'] == sel_ticker].iloc[0].to_dict()
-        prompt = f"""Analysiere {sel_ticker} extrem detailliert.
-        1. Berechne einen gemittelten Fair Value aus DCF, KGV-Historie und Peer-Group.
-        2. Vergleiche diesen mit meinem Wert ({stock_data['Fair Value']}€).
-        3. Erstelle einen Kaufplan mit 3 Tranchen (Einstiegskurse).
-        4. Risiko-Check: Bilanz & Markt.
-        Daten: {stock_info}"""
+    sel_ticker = st.selectbox("Aktie für Detail-Check wählen:", df_display['Ticker'])
+    modus = st.radio("Analyse-Fokus:", ["Fair Value & Tranchen", "Bilanz & Risiko", "Konkurrenz & Ranking"], horizontal=True)
+    
+    if st.button("KI Analyse starten"):
+        stock_context = df_display[df_display['Ticker'] == sel_ticker].iloc[0].to_dict()
+        
+        prompts = {
+            "Fair Value & Tranchen": f"Berechne einen gemittelten Fair Value für {sel_ticker} (DCF + Multiples). Erstelle einen 3-Tranchen-Einstiegsplan basierend auf Kurs {stock_context['Kurs']}. Daten: {stock_context}",
+            "Bilanz & Risiko": f"Analysiere Bilanzqualität und Verschuldung von {sel_ticker}. Wo liegen die größten Gefahren für das Geschäftsmodell?",
+            "Konkurrenz & Ranking": f"Vergleiche {sel_ticker} mit den wichtigsten Wettbewerbern in Bezug auf Margen und Marktmacht."
+        }
         
         with st.chat_message("assistant"):
-            st.markdown(ask_ki(prompt))
+            st.markdown(ask_ki(prompts[modus]))
+
+else:
+    st.info("Deine Watchlist ist leer. Füge in der Seitenleiste Ticker hinzu.")
