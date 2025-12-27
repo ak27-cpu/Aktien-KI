@@ -6,14 +6,15 @@ import numpy as np
 import google.generativeai as genai
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Investment Cockpit v7", layout="wide")
+st.set_page_config(page_title="Investment Cockpit v8", layout="wide")
 
+# Verbindung herstellen
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
     genai.configure(api_key=st.secrets["gemini_key"])
     ki_model = genai.GenerativeModel('models/gemini-2.0-flash')
 except Exception as e:
-    st.error(f"Setup Fehler: {e}")
+    st.error(f"Verbindungsfehler: {e}")
     st.stop()
 
 # --- 2. DATEN-FUNKTIONEN ---
@@ -50,93 +51,95 @@ def get_metrics(ticker):
         }
     except: return None
 
-# --- 3. SIDEBAR: FILTER & MANAGEMENT ---
+# --- 3. DATEN LADEN (VOR ALLEM ANDEREN) ---
+res = supabase.table("watchlist").select("*").execute()
+df_db = pd.DataFrame(res.data)
+
+# --- 4. SIDEBAR MANAGEMENT ---
 with st.sidebar:
-    st.header("⚙️ Cockpit Kontrolle")
-    view = st.radio("Ansicht wählen:", ["Alle Aktien", "Tranchen-Käufe", "Sparpläne"])
+    st.header("⚙️ Verwaltung")
+    
+    # Filter-Auswahl
+    view_option = st.selectbox("Watchlist Filter:", ["Alle", "Tranche", "Sparplan"])
     
     st.divider()
-    st.subheader("➕ Aktie hinzufügen")
-    new_ticker = st.text_input("Ticker (z.B. AAPL)").upper()
-    new_fv = st.number_input("Manueller Fair Value", min_value=0.0, step=1.0)
-    new_type = st.selectbox("Typ", ["Tranche", "Sparplan"])
-    
-    if st.button("Hinzufügen"):
-        if new_ticker:
-            data = {"ticker": new_ticker, "fair_value": new_fv, "watchlist_type": new_type}
-            supabase.table("watchlist").insert(data).execute()
-            st.success(f"{new_ticker} gespeichert!")
+    st.subheader("➕ Neu hinzufügen")
+    with st.form("add_form", clear_on_submit=True):
+        in_ticker = st.text_input("Ticker Symbol").upper()
+        in_fv = st.number_input("Fair Value", min_value=0.0)
+        in_type = st.selectbox("Typ", ["Tranche", "Sparplan"])
+        submit_add = st.form_submit_button("Speichern")
+        
+        if submit_add and in_ticker:
+            new_data = {"ticker": in_ticker, "fair_value": in_fv, "watchlist_type": in_type}
+            supabase.table("watchlist").insert(new_data).execute()
+            st.success(f"{in_ticker} hinzugefügt!")
             st.rerun()
 
     st.divider()
-    st.subheader("🗑️ Aktie löschen")
-    # Ticker Liste für Dropdown laden
-    ticker_res = supabase.table("watchlist").select("ticker").execute()
-    existing_tickers = [item['ticker'] for item in ticker_res.data]
-    del_ticker = st.selectbox("Ticker wählen", ["-"] + existing_tickers)
-    
-    if st.button("Löschen") and del_ticker != "-":
-        supabase.table("watchlist").delete().eq("ticker", del_ticker).execute()
-        st.warning(f"{del_ticker} entfernt.")
-        st.rerun()
+    st.subheader("🗑️ Löschen")
+    if not df_db.empty:
+        ticker_to_del = st.selectbox("Ticker wählen", df_db['ticker'].tolist())
+        if st.button("Endgültig löschen"):
+            supabase.table("watchlist").delete().eq("ticker", ticker_to_del).execute()
+            st.warning(f"{ticker_to_del} gelöscht.")
+            st.rerun()
 
     st.divider()
     base_mos = st.slider("Margin of Safety %", 0, 50, 15)
     t1_drop = st.slider("Tranche 1 (ATH-Korr %)", 5, 50, 15)
-    if st.button("🔄 Global Refresh"):
-        st.cache_data.clear()
-        st.rerun()
 
-# --- 4. DASHBOARD ANZEIGE ---
+# --- 5. DASHBOARD ANZEIGE ---
 vix, fg, spy_p = get_market_indicators()
-st.title("🏛️ Ultimate Terminal v7")
+st.title("🏛️ Investment Cockpit Ultimate")
 
 c1, c2, c3 = st.columns(3)
-c1.metric("VIX Index", vix)
+c1.metric("VIX", vix)
 c2.metric("Fear & Greed", f"{fg}/100")
 c3.metric("S&P 500 (1Y)", f"{round(spy_p, 1)}%")
 
-# Daten aus Supabase laden
-res = supabase.table("watchlist").select("*").execute()
-df_db = pd.DataFrame(res.data)
-
 if not df_db.empty:
-    # Filter
-    if view == "Tranchen-Käufe":
-        df_show = df_db[df_db['watchlist_type'] == 'Tranche']
-    elif view == "Sparpläne":
-        df_show = df_db[df_db['watchlist_type'] == 'Sparplan']
+    # SPALTEN-CHECK DIAGNOSE
+    if 'watchlist_type' not in df_db.columns:
+        st.error("🚨 FEHLER: Die Spalte 'watchlist_type' existiert nicht in deiner Supabase Tabelle!")
+        st.stop()
+
+    # FILTERUNG ANWENDEN
+    if view_option != "Alle":
+        # Wir filtern case-insensitive, um Fehler zu vermeiden
+        df_show = df_db[df_db['watchlist_type'].str.lower() == view_option.lower()]
     else:
         df_show = df_db
 
-    m_list, s_list, p_agg = [], [], []
-    
-    with st.spinner("Synchronisiere Daten..."):
-        for _, r in df_show.iterrows():
-            m = get_metrics(r['ticker'])
-            if m:
-                adj_fv = r['fair_value'] * (1 - (base_mos/100))
-                t1_p = m['ATH'] * (1 - t1_drop/100)
-                status = "🎯 BEREIT" if m['Preis'] <= t1_p and m['Preis'] <= adj_fv else "⏳ Warten"
-                
-                m_list.append({"Ticker": r['ticker'], "Name": m['Name'], "Kurs": m['Preis'], "Trend": m['Trend'], "RSI": m['RSI'], "Vol": m['Vol']})
-                s_list.append({"Ticker": r['ticker'], "Fair Value": r['fair_value'], "MoS-Preis": round(adj_fv, 2), "Abstand T1 %": round(((m['Preis']/t1_p)-1)*100, 1), "Status": status})
-                p_agg.append(m['Perf'])
+    if df_show.empty:
+        st.info(f"Keine Einträge für '{view_option}' gefunden.")
+    else:
+        m_list, s_list, p_agg = [], [], []
+        
+        with st.spinner("Berechne Daten..."):
+            for _, r in df_show.iterrows():
+                m = get_metrics(r['ticker'])
+                if m:
+                    adj_fv = r['fair_value'] * (1 - (base_mos/100))
+                    t1_p = m['ATH'] * (1 - t1_drop/100)
+                    status = "🎯 BEREIT" if m['Preis'] <= t1_p and m['Preis'] <= adj_fv else "⏳ Warten"
+                    
+                    m_list.append({"Ticker": r['ticker'], "Name": m['Name'], "Kurs": m['Preis'], "Trend": m['Trend'], "RSI": m['RSI'], "Vol": m['Vol']})
+                    s_list.append({"Ticker": r['ticker'], "Fair Value": r['fair_value'], "MoS-Preis": round(adj_fv, 2), "Abstand T1 %": round(((m['Preis']/t1_p)-1)*100, 1), "Status": status})
+                    p_agg.append(m['Perf'])
 
-    # Performance Expander
-    with st.expander("📈 PERFORMANCE ÜBERSICHT"):
-        if p_agg:
-            pa = pd.DataFrame(p_agg).mean()
-            pc = st.columns(5)
-            for i, label in enumerate(["1M", "3M", "6M", "1Y", "2Y"]):
-                pc[i].metric(label, f"{round(pa[label], 2)}%")
+        # Performance
+        with st.expander("📈 PERFORMANCE ÜBERSICHT"):
+            if p_agg:
+                pa = pd.DataFrame(p_agg).mean()
+                pc = st.columns(5)
+                for i, label in enumerate(["1M", "3M", "6M", "1Y", "2Y"]):
+                    pc[i].metric(label, f"{round(pa[label], 2)}%")
 
-    # Tabellen
-    t1, t2 = st.tabs(["📊 Markt", "🎯 Strategie"])
-    with t1: st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
-    with t2:
-        df_s = pd.DataFrame(s_list)
-        st.dataframe(df_s.style.apply(lambda x: ['background-color: #004d00' if "🎯" in str(x.Status) else '' for i in x], axis=1), use_container_width=True, hide_index=True)
-
+        # Tabellen
+        t1, t2 = st.tabs(["📊 Markt", "🎯 Strategie"])
+        with t1: st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
+        with t2:
+            st.dataframe(pd.DataFrame(s_list).style.apply(lambda x: ['background-color: #004d00' if "🎯" in str(x.Status) else '' for i in x], axis=1), use_container_width=True, hide_index=True)
 else:
-    st.info("Keine Aktien gefunden. Nutze die Sidebar zum Hinzufügen!")
+    st.info("Datenbank leer. Nutze die Sidebar zum Hinzufügen.")
