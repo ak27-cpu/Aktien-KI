@@ -8,11 +8,21 @@ import google.generativeai as genai
 st.set_page_config(page_title="KI Aktien-Terminal", layout="wide")
 
 # KI Setup
+# --- KI SETUP (AKTUALISIERT) ---
 if "gemini_key" in st.secrets:
     genai.configure(api_key=st.secrets["gemini_key"])
-    ki_model = genai.GenerativeModel('gemini-2.5-flash')
+    # Wir nutzen das neueste Modell aus deiner Liste
+    ki_model = genai.GenerativeModel('models/gemini-2.5-flash')
 else:
     st.error("Gemini API Key fehlt in den Secrets!")
+
+def ask_ki(prompt):
+    try:
+        # Sicherheits-Check: Falls das Modell eine Antwort verweigert
+        response = ki_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"KI-Fehler: {str(e)}. Versuche es in einem Moment erneut."
 
 # Supabase Setup
 @st.cache_resource
