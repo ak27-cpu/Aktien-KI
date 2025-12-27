@@ -6,7 +6,7 @@ import numpy as np
 import google.generativeai as genai
 
 # --- 1. SETUP & KONFIGURATION ---
-st.set_page_config(page_title="Investment Terminal 2025 Pro", layout="wide")
+st.set_page_config(page_title="Investment Cockpit 2025", layout="wide")
 
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
@@ -16,7 +16,7 @@ except Exception as e:
     st.error(f"Setup Fehler: {e}")
     st.stop()
 
-# --- 2. MARKT-INDIKATOREN ---
+# --- 2. MARKT-INDIKATOREN (VIX & FEAR/GREED) ---
 def get_market_indicators():
     try:
         vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
@@ -28,15 +28,18 @@ def get_market_indicators():
     except: return 20.0, 50
 
 @st.cache_data(ttl=1800)
-def get_extended_metrics(ticker):
+def get_full_metrics(ticker):
     try:
         s = yf.Ticker(ticker)
         h = s.history(period="2y")
         if h.empty: return None
+        
+        info = s.info
         cp = h['Close'].iloc[-1]
         ath = h['High'].max()
+        vol = h['Volume'].iloc[-1] # Aktuelles Tagesvolumen
         
-        # Trend: 200-Tage-Linie
+        # SMA 200 Trend
         sma200 = h['Close'].rolling(window=200).mean().iloc[-1]
         trend = "Bullish 📈" if cp > sma200 else "Bearish 📉"
         
@@ -46,72 +49,124 @@ def get_extended_metrics(ticker):
         l = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + (g/l))).iloc[-1]
         
-        return {"Preis": round(cp, 2), "ATH": round(ath, 2), "RSI": round(rsi, 1), "SMA200": round(sma200, 2), "Trend": trend}
+        return {
+            "Name": info.get('longName', ticker),
+            "Sektor": info.get('sector', 'N/A'),
+            "Preis": round(cp, 2),
+            "ATH": round(ath, 2),
+            "RSI": round(rsi, 1),
+            "Trend": trend,
+            "Volumen": vol,
+            "Korrektur_ATH": round(((cp/ath)-1)*100, 1)
+        }
     except: return None
 
 # --- 3. HEADER & BANNER ---
 vix, fg = get_market_indicators()
-st.title("🏛️ Investment Cockpit Pro")
+st.title("🏛️ Professional Investment Cockpit")
+
 c1, c2 = st.columns(2)
 with c1:
     if vix < 20: st.success(f"📉 VIX: {vix} (Ruhig)")
     elif vix < 30: st.warning(f"⚠️ VIX: {vix} (Nervös)")
     else: st.error(f"🚨 VIX: {vix} (PANIK)")
 with c2:
-    if fg < 35: st.success(f"😱 Fear & Greed: {fg}/100 (Kaufchance)")
+    if fg < 35: st.success(f"😱 Fear & Greed: {fg}/100 (Angst = KAUFCHANCE)")
     elif fg < 70: st.info(f"⚖️ Fear & Greed: {fg}/100 (Neutral)")
-    else: st.error(f"🔥 Fear & Greed: {fg}/100 (Gier - Vorsicht)")
+    else: st.error(f"🔥 Fear & Greed: {fg}/100 (Gier = VORSICHT)")
+
 st.divider()
 
 # --- 4. SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Strategie")
-    base_mos = st.slider("Basis MoS (%)", 0, 50, 15)
-    t1_drop = st.slider("Tranche 1 (ATH-Korr %)", 5, 50, 15)
-    rsi_limit = st.slider("Max. RSI für Kauf", 20, 70, 45)
+    st.header("⚙️ Strategie & MoS")
+    base_mos = st.slider("Basis Margin of Safety (%)", 0, 50, 15)
+    t1_drop = st.slider("Tranche 1 (Korr. vom ATH %)", 5, 50, 15)
+    t2_drop = st.slider("Tranche 2 (Korr. vom ATH %)", 10, 70, 30)
     
     # Dynamische MoS Anpassung
     mos_adj = 10 if fg > 70 else (-5 if fg < 30 else 0)
     total_mos = base_mos + mos_adj
     st.info(f"Gesamt-MoS: {total_mos}%")
-    if st.button("🔄 Refresh"):
+    
+    if st.button("🔄 Alle Daten aktualisieren"):
         st.cache_data.clear()
         st.rerun()
 
-# --- 5. WATCHLIST ---
+# --- 5. DATENVERARBEITUNG ---
 res = supabase.table("watchlist").select("*").execute()
 df_db = pd.DataFrame(res.data)
 
 if not df_db.empty:
-    rows = []
-    for _, r in df_db.iterrows():
-        m = get_extended_metrics(r['ticker'])
-        if m:
-            fv_adj = r['fair_value'] * (1 - total_mos/100)
-            t1_p = m['ATH'] * (1 - t1_drop/100)
-            
-            status = "⏳ Warten"
-            if m['Preis'] <= fv_adj and m['Preis'] <= t1_p:
-                status = "🎯 KAUFZONE" if m['RSI'] <= rsi_limit else "⚠️ RSI HOCH"
-            
-            rows.append({
-                "Ticker": r['ticker'], "Kurs": m['Preis'], "MoS-FV": round(fv_adj, 2),
-                "Trend": m['Trend'], "RSI": m['RSI'], "Status": status, "Korr/ATH": f"{round(((m['Preis']/m['ATH'])-1)*100, 1)}%"
-            })
+    market_data = []
+    strat_data = []
+    
+    with st.spinner("Synchronisiere Live-Daten..."):
+        for _, r in df_db.iterrows():
+            m = get_full_metrics(r['ticker'])
+            if m:
+                # Logik für Tabelle 2
+                fv_basis = r.get('fair_value', 0)
+                adjusted_fv = fv_basis * (1 - (total_mos / 100))
+                t1_p = m['ATH'] * (1 - t1_drop/100)
+                t2_p = m['ATH'] * (1 - t2_drop/100)
+                
+                # Tabelle 1: Basis Daten
+                market_data.append({
+                    "Ticker": r['ticker'],
+                    "Name": m['Name'],
+                    "Sektor": m['Sektor'],
+                    "Kurs": m['Preis'],
+                    "RSI": m['RSI'],
+                    "Trend": m['Trend'],
+                    "Korr/ATH %": m['Korrektur_ATH'],
+                    "Volumen (Stk)": f"{m['Volumen']:,}"
+                })
+                
+                # Tabelle 2: Strategische Bewertung
+                status = "⏳ Warten"
+                if m['Preis'] <= adjusted_fv and m['Preis'] <= t1_p: status = "🎯 TR1 BEREIT"
+                if m['Preis'] <= t2_p: status = "🔥 TR2 LIMIT"
+                
+                strat_data.append({
+                    "Ticker": r['ticker'],
+                    "Fair Value (Basis)": fv_basis,
+                    "Fair Value (MoS)": round(adjusted_fv, 2),
+                    "Tranche 1 Preis": round(t1_p, 2),
+                    "Tranche 2 Preis": round(t2_p, 2),
+                    "Bewertung": status
+                })
 
-    df_f = pd.DataFrame(rows)
-    def style_stat(v):
-        if "🎯" in v: return 'background-color: #004d00'
-        if "⚠️" in v: return 'background-color: #4d4d00'
+    # --- ANZEIGE TABELLE 1 ---
+    st.subheader("1️⃣ Basis Marktdaten & Volumen")
+    st.dataframe(pd.DataFrame(market_data), use_container_width=True, hide_index=True)
+
+    # --- ANZEIGE TABELLE 2 ---
+    st.subheader("2️⃣ Strategische Bewertung & Tranchen")
+    
+    def style_eval(v):
+        if "🎯" in v: return 'background-color: #004d00; color: white'
+        if "🔥" in v: return 'background-color: #800000; color: white'
         return ''
     
-    st.dataframe(df_f.style.applymap(style_stat, subset=['Status']), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(strat_data).style.applymap(style_eval, subset=['Bewertung']), 
+                 use_container_width=True, hide_index=True)
 
     # --- 6. KI ANALYSE ---
     st.divider()
-    sel = st.selectbox("Deep Dive:", df_f['Ticker'])
-    if st.button("Experten-Check"):
-        ctx = df_f[df_f['Ticker'] == sel].iloc[0].to_dict()
-        prompt = f"Analysiere {sel}. Markt: VIX {vix}, F&G {fg}. Trend ist {ctx['Trend']}. FV-MoS: {ctx['MoS-FV']}. Fazit?"
+    sel_ticker = st.selectbox("KI Deep-Dive Analyse:", [d['Ticker'] for d in market_data])
+    if st.button("Analyse-Prozess starten"):
+        m_ctx = next(item for item in market_data if item["Ticker"] == sel_ticker)
+        s_ctx = next(item for item in strat_data if item["Ticker"] == sel_ticker)
+        
+        prompt = f"""Analysiere {sel_ticker} ({m_ctx['Name']}). 
+        Marktkontext: VIX {vix}, Fear&Greed {fg}.
+        Technik: RSI {m_ctx['RSI']}, Trend {m_ctx['Trend']}, Korrektur vom ATH {m_ctx['Korr/ATH %']}.
+        Bewertung: Fair Value Basis {s_ctx['Fair Value (Basis)']}, MoS-Ziel {s_ctx['Fair Value (MoS)']}.
+        Berücksichtige das Volumen von {m_ctx['Volumen (Stk)']} für die Bestätigung des Trends."""
+        
         with st.chat_message("assistant"):
             st.markdown(ki_model.generate_content(prompt).text)
+
+else:
+    st.info("Datenbank ist leer. Bitte Ticker in Supabase hinzufügen.")
