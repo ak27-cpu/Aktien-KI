@@ -3,4 +3,4 @@ gspread
 google-auth
 yfinance
 pandas
-superbase
+supabase
