@@ -2,6 +2,7 @@ import streamlit as st
 from supabase import create_client, Client
 import yfinance as yf
 import pandas as pd
+import google.generativeai as genai
 
 # --- KONFIGURATION ---
 st.set_page_config(page_title="Aktien-KI | Supabase", layout="wide")
@@ -148,3 +149,51 @@ if not df_db.empty:
                     else:
                         st.warning(f"+{stock['Abstand_FV_%']}%")
                 st.divider()
+                
+
+# --- KI KONFIGURATION ---
+genai.configure(api_key=st.secrets["gemini_key"])
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+def get_ki_bewertung(ticker, daten, meine_regeln):
+    prompt = f"""
+    Du bist ein professioneller Aktien-Analyst. Analysiere die Aktie {ticker} basierend auf diesen Daten:
+    - Aktueller Kurs: {daten['Live_Kurs']}€
+    - Mein Fairer Wert: {daten['fair_value']}€
+    - Schulden-Quote (Debt/Equity): {daten['Schulden_Quote']}
+    - Trend: {daten['Trend']}
+    - Korrektur vom Hoch: {daten['Korrektur_%']}%
+
+    Deine Kriterien sind: {meine_regeln}
+
+    Antworte extrem kurz und präzise für eine Handy-Ansicht:
+    1. Urteil: (KAUFEN, HALTEN oder WARTEN)
+    2. Grund: (Maximal 15 Wörter)
+    3. Risiko: (Was ist das größte Problem?)
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except:
+        return "KI-Analyse derzeit nicht verfügbar."
+
+# --- INTEGRATION IN DAS HAUPTPROGRAMM ---
+# (Füge dies dort ein, wo die Ergebnisse verarbeitet werden)
+
+st.subheader("🤖 KI-Investment-Check")
+
+# Wir nehmen die Regeln als editierbaren Text in der Sidebar
+with st.sidebar:
+    meine_regeln = st.text_area("Meine KI-Anweisungen", 
+        value="Schulden unter 0.6 bevorzugt. Kauf nur wenn Kurs unter Fair Value oder maximal 5% darüber. Trend muss positiv sein.")
+
+if not df_final.empty:
+    selected_ticker = st.selectbox("Wähle eine Aktie für den Deep-Dive:", df_final['ticker'])
+    
+    if st.button(f"{selected_ticker} jetzt analysieren"):
+        ticker_data = df_final[df_final['ticker'] == selected_ticker].iloc[0].to_dict()
+        
+        with st.chat_message("assistant"):
+            st.write(f"**Analysten-Bericht für {selected_ticker}:**")
+            analyse = get_ki_bewertung(selected_ticker, ticker_data, meine_regeln)
+            st.write(analyse)
