@@ -10,7 +10,7 @@ st.set_page_config(page_title="KI Aktien-Terminal", layout="wide")
 # KI Setup
 if "gemini_key" in st.secrets:
     genai.configure(api_key=st.secrets["gemini_key"])
-    ki_model = genai.GenerativeModel('gemini-1.5-flash')
+    ki_model = genai.GenerativeModel('gemini-2.5-flash')
 else:
     st.error("Gemini API Key fehlt in den Secrets!")
 
