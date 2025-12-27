@@ -4,181 +4,74 @@ import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 
-# --- KONFIGURATION ---
-st.set_page_config(page_title="Aktien-KI | Supabase", layout="wide")
+# --- 1. KONFIGURATION & SETUP ---
+st.set_page_config(page_title="KI Aktien-Terminal", layout="wide")
 
-# --- SUPABASE VERBINDUNG ---
+# KI Setup
+if "gemini_key" in st.secrets:
+    genai.configure(api_key=st.secrets["gemini_key"])
+    ki_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    st.error("Gemini API Key fehlt in den Secrets!")
+
+# Supabase Setup
 @st.cache_resource
 def get_supabase():
-    # Diese Werte müssen in den Streamlit Secrets stehen
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
+    return create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 
 supabase = get_supabase()
 
-# --- DATEN-FUNKTIONEN ---
+# --- 2. FUNKTIONEN ---
 def load_watchlist():
-    response = supabase.table("watchlist").select("*").execute()
-    return pd.DataFrame(response.data)
+    res = supabase.table("watchlist").select("*").execute()
+    return pd.DataFrame(res.data)
 
-def add_ticker(ticker, fair_value):
-    try:
-        supabase.table("watchlist").insert({
-            "ticker": ticker.upper(),
-            "fair_value": fair_value
-        }).execute()
-        return True
-    except:
-        return False
-
-def delete_ticker(ticker_id):
-    supabase.table("watchlist").delete().eq("id", ticker_id).execute()
-
-# --- ANALYSE-LOGIK ---
 @st.cache_data(ttl=3600)
-def get_live_metrics(ticker):
+def get_live_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         hist = stock.history(period="2y")
-        if hist.empty: return None
-
         price = info.get('currentPrice') or hist['Close'].iloc[-1]
-        de = info.get('debtToEquity', 0)
-        debt_ratio = de / 100 if de > 2 else de
-        
-        ath = info.get('fiftyTwoWeekHigh') or hist['High'].max()
-        correction = ((price / ath) - 1) * 100
         sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
-
         return {
-            "Live_Kurs": round(price, 2),
-            "Schulden_Quote": round(debt_ratio, 3),
-            "Korrektur_%": round(correction, 1),
-            "Trend": "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️"
+            "Kurs": round(price, 2),
+            "Schulden_Quote": round(info.get('debtToEquity', 0) / 100 if info.get('debtToEquity', 0) > 2 else info.get('debtToEquity', 0), 2),
+            "Trend": "Aufwärts ✅" if price > sma200 else "Abwärts ⚠️",
+            "KGV": info.get('trailingPE', 'N/A')
         }
-    except:
-        return None
+    except: return None
 
-# --- UI DESIGN ---
-st.title("🚀 Meine KI-Watchlist")
-st.caption("Datenquelle: Supabase SQL & Yahoo Finance")
-
-# Sidebar für Verwaltung
-with st.sidebar:
-    st.header("➕ Neue Aktie")
-    with st.form("add_form", clear_on_submit=True):
-        new_t = st.text_input("Ticker (z.B. AAPL, SAP.DE)")
-        new_fv = st.number_input("Mein Fairer Wert", value=0.0)
-        submit = st.form_submit_button("Hinzufügen")
-        
-        if submit and new_t:
-            if add_ticker(new_t, new_fv):
-                st.success("Gespeichert!")
-                st.rerun()
-            else:
-                st.error("Fehler (Ticker schon vorhanden?)")
-
-# Hauptinhalt
-# --- BERECHNUNGEN & UI ERWEITERUNG ---
-df_db = load_watchlist()
-
-if not df_db.empty:
-    results = []
-    for _, row in df_db.iterrows():
-        with st.spinner(f"Analysiere {row['ticker']}..."):
-            live = get_live_metrics(row['ticker'])
-            if live:
-                # 1. Berechnung: Abstand zum Fairen Wert
-                fv = row.get('fair_value', 0)
-                diff_to_fv = ((live['Live_Kurs'] / fv) - 1) * 100 if fv > 0 else 0
-                
-                # Alles zusammenfügen
-                results.append({
-                    **row, 
-                    **live, 
-                    "Abstand_FV_%": round(diff_to_fv, 1)
-                })
-
-    if results:
-        df_final = pd.DataFrame(results)
-        
-        # --- METRIKEN OBEN (Zusammenfassung) ---
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Aktien in Watchlist", len(df_final))
-        # Zähle wie viele im Aufwärtstrend sind
-        uptrend_count = df_final[df_final['Trend'].str.contains("Aufwärts")].shape[0]
-        c2.metric("Im Aufwärtstrend", f"{uptrend_count}")
-        # Günstigste Aktie finden
-        top_pick = df_final.loc[df_final['Abstand_FV_%'].idxmin()]
-        c3.metric("Top Pick (FV)", top_pick['ticker'], f"{top_pick['Abstand_FV_%']}%")
-
-        # --- TABELLEN-STYLING ---
-        st.subheader("Detail-Analyse")
-        
-        def color_logic(val):
-            if isinstance(val, (int, float)):
-                if val < 0: return 'color: #00ff00; font-weight: bold' # Unter Fair Value = Grün
-                if val > 20: return 'color: #ff4b4b' # Weit über Fair Value = Rot
-            return ''
-
-        st.dataframe(
-            df_final.style.applymap(color_logic, subset=['Abstand_FV_%'])
-            .format({
-                "Schulden_Quote": "{:.2f}", 
-                "Live_Kurs": "{:.2f} €", 
-                "Abstand_FV_%": "{:+.1f}%"
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        # --- MOBILE KARTEN (Extra für das iPhone) ---
-        st.write("### 📱 Mobile Check")
-        for _, stock in df_final.iterrows():
-            with st.container():
-                col_a, col_b = st.columns([2, 1])
-                with col_a:
-                    st.markdown(f"**{stock['ticker']}** | {stock['sector'] or 'Diverse'}")
-                    st.markdown(f"Kurs: {stock['Live_Kurs']} € (Ziel: {stock['fair_value']} €)")
-                with col_b:
-                    # Kleiner visueller Marker für den Kaufpreis
-                    if stock['Abstand_FV_%'] <= 0:
-                        st.success("KAUFZONE")
-                    else:
-                        st.warning(f"+{stock['Abstand_FV_%']}%")
-                st.divider()
-                
-
-import google.generativeai as genai
-
-# --- KI SETUP ---
-genai.configure(api_key=st.secrets["gemini_key"])
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-def ask_gemini(prompt):
+def ask_ki(prompt):
     try:
-        response = model.generate_content(prompt)
+        response = ki_model.generate_content(prompt)
         return response.text
-    except Exception as e:
-        return f"Fehler bei der KI-Analyse: {e}"
+    except Exception as e: return f"Fehler: {e}"
 
-# --- HAUPTINHALT ---
+# --- 3. HAUPT-UI ---
+st.title("🚀 Mein KI-Aktien-Terminal")
+
+# Sidebar: Verwaltung
+with st.sidebar:
+    st.header("➕ Watchlist")
+    t_input = st.text_input("Ticker").upper()
+    fv_input = st.number_input("Fair Value", value=0.0)
+    if st.button("Hinzufügen"):
+        supabase.table("watchlist").insert({"ticker": t_input, "fair_value": fv_input}).execute()
+        st.rerun()
+
+# Daten laden
 df_db = load_watchlist()
 
 if not df_db.empty:
-    results = []
-    # Live-Daten für alle Ticker sammeln
-    for _, row in df_db.iterrows():
-        live = get_live_metrics(row['ticker'])
-        if live:
-            results.append({**row, **live})
+    # Live-Daten mischen
+    with st.spinner("Lade Marktdaten..."):
+        all_data = []
+        for _, row in df_db.iterrows():
+            live = get_live_data(row['ticker'])
+            if live: all_data.append({**row, **live})
     
-    df_final = pd.DataFrame(results)
-
-    # --- TABELLEN ANSICHT ---
-    st.subheader("📊 Deine Watchlist")
+    df_final = pd.DataFrame(all_data)
     st.dataframe(df_final, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -186,70 +79,27 @@ if not df_db.empty:
     # --- KI ANALYSE BEREICH ---
     st.subheader("🤖 KI Analysten-Terminal")
     
-    # Auswahl der Aktie und des Modus
-    col_select, col_mode = st.columns([1, 1])
-    with col_select:
-        selected_ticker = st.selectbox("Welche Aktie analysieren?", df_final['ticker'])
-    with col_mode:
-        modus = st.selectbox("Analyse-Modus wählen:", [
-            "Komplett-Analyse (Equity Report)",
-            "Bewertungs-Profi (DCF + Multiples)",
-            "Dividenden-Sicherheitscheck",
-            "Konkurrenz- & Marktvergleich",
-            "Crash- & Rezessionsanalyse",
-            "Portfolio-Optimierungs-Check"
-        ])
+    sel_ticker = st.selectbox("Aktie wählen:", df_final['ticker'])
+    modus = st.radio("Analyse-Typ:", [
+        "Komplett-Analyse", "Bewertungs-Profi", "Dividenden-Check", 
+        "Konkurrenz-Vergleich", "Crash-Analyse", "Portfolio-Check"
+    ], horizontal=True)
 
-    # Daten der gewählten Aktie für den Prompt vorbereiten
-    stock_data = df_final[df_final['ticker'] == selected_ticker].iloc[0].to_dict()
-    
-    # --- PROMPT LOGIK ---
-    if st.button(f"Starte {modus}"):
-        with st.spinner(f"KI erstellt {modus} für {selected_ticker}..."):
-            
-            if modus == "Komplett-Analyse (Equity Report)":
-                prompt = f"""Analysiere die Aktie {selected_ticker} wie ein professioneller Equity-Analyst. 
-                Erstelle eine vollständige, faktenbasierte und präzise Analyse mit folgender Struktur:
-                1. Geschäftsmodell & Segmente, 2. Fundamentaldaten (5 Jahre), 3. Bewertung (KGV, FCF-Yield vs Historie), 
-                4. Bilanzqualität, 5. Dividendenprofil, 6. Chancen & Risiken, 7. Management & Kapitalallokation, 
-                8. Szenarien (Bull/Base/Bear) mit Fair Value Range, 9. Investmentfazit (Kaufen/Halten/Beobachten).
-                Datenkontext: {stock_data}"""
-
-            elif modus == "Bewertungs-Profi (DCF + Multiples)":
-                prompt = f"""Berechne den fairen Wert von {selected_ticker} anhand: 
-                - DCF-Modell (vereinfacht), - Multiples (KGV, EV/EBITDA, FCF-Yield), - Branchenvergleich.
-                Gib am Ende einen fairen Preis (Range) und die wichtigsten Annahmen an.
-                Datenkontext: {stock_data}"""
-
-            elif modus == "Dividenden-Sicherheitscheck":
-                prompt = f"""Analysiere die Dividendenqualität von {selected_ticker}:
-                Ausschüttungsquote (EPS + FCF), Historie, Stabilität, Wachstumspotenzial und Risiken.
-                Urteil: sicher, fraglich oder riskant. Datenkontext: {stock_data}"""
-
-            elif modus == "Konkurrenz- & Marktvergleich":
-                prompt = f"""Vergleiche {selected_ticker} mit ihren 3 größten Konkurrenten.
-                Bewerte: Bewertung, Wachstum, Margen, Verschuldung, Marktanteil, Burggraben.
-                Erstelle am Ende ein Ranking."""
-
-            elif modus == "Crash- & Rezessionsanalyse":
-                prompt = f"""Analysiere, wie sich {selected_ticker} in Krisen/Rezessionen historisch verhalten hat.
-                Bewerte Cashflow-Beständigkeit und Erholungsgeschwindigkeit. 
-                Gesamtbewertung Krisenstabilität (1-10)."""
-
-            elif modus == "Portfolio-Optimierungs-Check":
-                alle_ticker = df_final['ticker'].tolist()
-                prompt = f"""Bewerte mein Portfolio: {alle_ticker}.
-                Analysiere Diversifikation, Sektorgewichtung und Klumpenrisiken. 
-                Gib konkrete Verbesserungsvorschläge ohne Allgemeinplätze."""
-
-            # Ergebnis anzeigen
-            st.markdown("---")
-            st.markdown(f"### 📋 {modus}: {selected_ticker}")
-            bericht = ask_gemini(prompt)
+    # Hier greift dein Experten-Regelwerk
+    if st.button(f"Analyse für {sel_ticker} starten"):
+        stock_info = df_final[df_final['ticker'] == sel_ticker].iloc[0].to_dict()
+        
+        prompts = {
+            "Komplett-Analyse": f"Analysiere {sel_ticker} wie ein Profi-Equity-Analyst: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanz, 5. Dividende, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Daten: {stock_info}",
+            "Bewertungs-Profi": f"Berechne fairen Wert für {sel_ticker} via DCF, Multiples & Branchenvergleich. Daten: {stock_info}",
+            "Dividenden-Check": f"Prüfe Dividendenqualität von {sel_ticker}: Quote, Historie, Sicherheit. Urteil: sicher, fraglich, riskant.",
+            "Konkurrenz-Vergleich": f"Vergleiche {sel_ticker} mit 3 Konkurrenten (Wachstum, Margen, Burggraben). Erstelle Ranking.",
+            "Crash-Analyse": f"Historisches Verhalten von {sel_ticker} in Krisen. Stabilität 1-10.",
+            "Portfolio-Check": f"Bewerte mein Portfolio: {df_final['ticker'].tolist()}. Fokus auf Klumpenrisiken & Optimierung."
+        }
+        
+        with st.chat_message("assistant"):
+            bericht = ask_ki(prompts[modus])
             st.markdown(bericht)
-            
-            # Download Button für den Bericht
-            st.download_button("Bericht als Text speichern", bericht, file_name=f"Analyse_{selected_ticker}.txt")
-
 else:
-    st.info("Füge zuerst Ticker in deine Supabase-Datenbank ein.")
+    st.info("Noch keine Ticker in der Datenbank.")
