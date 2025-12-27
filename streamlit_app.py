@@ -151,49 +151,105 @@ if not df_db.empty:
                 st.divider()
                 
 
-# --- KI KONFIGURATION ---
+import google.generativeai as genai
+
+# --- KI SETUP ---
 genai.configure(api_key=st.secrets["gemini_key"])
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-def get_ki_bewertung(ticker, daten, meine_regeln):
-    prompt = f"""
-    Du bist ein professioneller Aktien-Analyst. Analysiere die Aktie {ticker} basierend auf diesen Daten:
-    - Aktueller Kurs: {daten['Live_Kurs']}€
-    - Mein Fairer Wert: {daten['fair_value']}€
-    - Schulden-Quote (Debt/Equity): {daten['Schulden_Quote']}
-    - Trend: {daten['Trend']}
-    - Korrektur vom Hoch: {daten['Korrektur_%']}%
-
-    Deine Kriterien sind: {meine_regeln}
-
-    Antworte extrem kurz und präzise für eine Handy-Ansicht:
-    1. Urteil: (KAUFEN, HALTEN oder WARTEN)
-    2. Grund: (Maximal 15 Wörter)
-    3. Risiko: (Was ist das größte Problem?)
-    """
+def ask_gemini(prompt):
     try:
         response = model.generate_content(prompt)
         return response.text
-    except:
-        return "KI-Analyse derzeit nicht verfügbar."
+    except Exception as e:
+        return f"Fehler bei der KI-Analyse: {e}"
 
-# --- INTEGRATION IN DAS HAUPTPROGRAMM ---
-# (Füge dies dort ein, wo die Ergebnisse verarbeitet werden)
+# --- HAUPTINHALT ---
+df_db = load_watchlist()
 
-st.subheader("🤖 KI-Investment-Check")
-
-# Wir nehmen die Regeln als editierbaren Text in der Sidebar
-with st.sidebar:
-    meine_regeln = st.text_area("Meine KI-Anweisungen", 
-        value="Schulden unter 0.6 bevorzugt. Kauf nur wenn Kurs unter Fair Value oder maximal 5% darüber. Trend muss positiv sein.")
-
-if not df_final.empty:
-    selected_ticker = st.selectbox("Wähle eine Aktie für den Deep-Dive:", df_final['ticker'])
+if not df_db.empty:
+    results = []
+    # Live-Daten für alle Ticker sammeln
+    for _, row in df_db.iterrows():
+        live = get_live_metrics(row['ticker'])
+        if live:
+            results.append({**row, **live})
     
-    if st.button(f"{selected_ticker} jetzt analysieren"):
-        ticker_data = df_final[df_final['ticker'] == selected_ticker].iloc[0].to_dict()
-        
-        with st.chat_message("assistant"):
-            st.write(f"**Analysten-Bericht für {selected_ticker}:**")
-            analyse = get_ki_bewertung(selected_ticker, ticker_data, meine_regeln)
-            st.write(analyse)
+    df_final = pd.DataFrame(results)
+
+    # --- TABELLEN ANSICHT ---
+    st.subheader("📊 Deine Watchlist")
+    st.dataframe(df_final, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --- KI ANALYSE BEREICH ---
+    st.subheader("🤖 KI Analysten-Terminal")
+    
+    # Auswahl der Aktie und des Modus
+    col_select, col_mode = st.columns([1, 1])
+    with col_select:
+        selected_ticker = st.selectbox("Welche Aktie analysieren?", df_final['ticker'])
+    with col_mode:
+        modus = st.selectbox("Analyse-Modus wählen:", [
+            "Komplett-Analyse (Equity Report)",
+            "Bewertungs-Profi (DCF + Multiples)",
+            "Dividenden-Sicherheitscheck",
+            "Konkurrenz- & Marktvergleich",
+            "Crash- & Rezessionsanalyse",
+            "Portfolio-Optimierungs-Check"
+        ])
+
+    # Daten der gewählten Aktie für den Prompt vorbereiten
+    stock_data = df_final[df_final['ticker'] == selected_ticker].iloc[0].to_dict()
+    
+    # --- PROMPT LOGIK ---
+    if st.button(f"Starte {modus}"):
+        with st.spinner(f"KI erstellt {modus} für {selected_ticker}..."):
+            
+            if modus == "Komplett-Analyse (Equity Report)":
+                prompt = f"""Analysiere die Aktie {selected_ticker} wie ein professioneller Equity-Analyst. 
+                Erstelle eine vollständige, faktenbasierte und präzise Analyse mit folgender Struktur:
+                1. Geschäftsmodell & Segmente, 2. Fundamentaldaten (5 Jahre), 3. Bewertung (KGV, FCF-Yield vs Historie), 
+                4. Bilanzqualität, 5. Dividendenprofil, 6. Chancen & Risiken, 7. Management & Kapitalallokation, 
+                8. Szenarien (Bull/Base/Bear) mit Fair Value Range, 9. Investmentfazit (Kaufen/Halten/Beobachten).
+                Datenkontext: {stock_data}"""
+
+            elif modus == "Bewertungs-Profi (DCF + Multiples)":
+                prompt = f"""Berechne den fairen Wert von {selected_ticker} anhand: 
+                - DCF-Modell (vereinfacht), - Multiples (KGV, EV/EBITDA, FCF-Yield), - Branchenvergleich.
+                Gib am Ende einen fairen Preis (Range) und die wichtigsten Annahmen an.
+                Datenkontext: {stock_data}"""
+
+            elif modus == "Dividenden-Sicherheitscheck":
+                prompt = f"""Analysiere die Dividendenqualität von {selected_ticker}:
+                Ausschüttungsquote (EPS + FCF), Historie, Stabilität, Wachstumspotenzial und Risiken.
+                Urteil: sicher, fraglich oder riskant. Datenkontext: {stock_data}"""
+
+            elif modus == "Konkurrenz- & Marktvergleich":
+                prompt = f"""Vergleiche {selected_ticker} mit ihren 3 größten Konkurrenten.
+                Bewerte: Bewertung, Wachstum, Margen, Verschuldung, Marktanteil, Burggraben.
+                Erstelle am Ende ein Ranking."""
+
+            elif modus == "Crash- & Rezessionsanalyse":
+                prompt = f"""Analysiere, wie sich {selected_ticker} in Krisen/Rezessionen historisch verhalten hat.
+                Bewerte Cashflow-Beständigkeit und Erholungsgeschwindigkeit. 
+                Gesamtbewertung Krisenstabilität (1-10)."""
+
+            elif modus == "Portfolio-Optimierungs-Check":
+                alle_ticker = df_final['ticker'].tolist()
+                prompt = f"""Bewerte mein Portfolio: {alle_ticker}.
+                Analysiere Diversifikation, Sektorgewichtung und Klumpenrisiken. 
+                Gib konkrete Verbesserungsvorschläge ohne Allgemeinplätze."""
+
+            # Ergebnis anzeigen
+            st.markdown("---")
+            st.markdown(f"### 📋 {modus}: {selected_ticker}")
+            bericht = ask_gemini(prompt)
+            st.markdown(bericht)
+            
+            # Download Button für den Bericht
+            st.download_button("Bericht als Text speichern", bericht, file_name=f"Analyse_{selected_ticker}.txt")
+
+else:
+    st.info("Füge zuerst Ticker in deine Supabase-Datenbank ein.")
