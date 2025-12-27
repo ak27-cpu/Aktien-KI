@@ -7,7 +7,7 @@ import google.generativeai as genai
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Investment Cockpit Ultimate v10", layout="wide")
+st.set_page_config(page_title="Investment Cockpit v11", layout="wide")
 
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
@@ -32,42 +32,33 @@ def get_market_indicators():
 def get_metrics(ticker):
     try:
         s = yf.Ticker(ticker)
-        # 3 Jahre Daten laden für stabile Performance-Vergleiche
         h = s.history(period="3y")
         if h.empty: return None
         info = s.info
         cp = h['Close'].iloc[-1]
         ath = h['High'].max()
         
-        # PRÄZISE PERFORMANCE LOGIK
         def get_exact_perf(days):
             target_date = h.index[-1] - timedelta(days=days)
-            # Findet den nächsten verfügbaren Handelstag zum Zieldatum
             idx = h.index.get_indexer([target_date], method='nearest')[0]
             old_price = h['Close'].iloc[idx]
             return round(((cp / old_price) - 1) * 100, 2)
 
-        # Jährliche Performance (p.a.) für 2 Jahre berechnen
         perf_2y_total = get_exact_perf(730)
         perf_2y_pa = round(((1 + perf_2y_total/100)**(1/2) - 1) * 100, 2)
 
         return {
             "Name": info.get('longName', ticker),
-            "Sektor": info.get('sector', 'N/A'),
             "Preis": round(cp, 2),
             "ATH": round(ath, 2),
+            "ATH_Dist": round(((cp / ath) - 1) * 100, 1),
             "RSI": round((lambda d: 100 - (100 / (1 + (d.where(d > 0, 0).rolling(14).mean() / (-d.where(d < 0, 0)).rolling(14).mean()))).iloc[-1])(h['Close'].diff()), 1),
             "Trend": "Bull 📈" if cp > h['Close'].rolling(200).mean().iloc[-1] else "Bear 📉",
             "Vol": round(h['Volume'].iloc[-1] / h['Volume'].tail(20).mean(), 2),
             "KGV": info.get('trailingPE', 0),
             "Div": round(info.get('dividendYield', 0) * 100, 2) if info.get('dividendYield') else 0,
-            "Perf": {
-                "1M": get_exact_perf(30),
-                "3M": get_exact_perf(91),
-                "6M": get_exact_perf(182),
-                "1Y": get_exact_perf(365),
-                "2Y p.a.": perf_2y_pa
-            }
+            "Avg_Perf": round((get_exact_perf(30) + get_exact_perf(91) + get_exact_perf(182) + get_exact_perf(365)) / 4, 2),
+            "Perf": {"1M": get_exact_perf(30), "1Y": get_exact_perf(365), "2Y p.a.": perf_2y_pa}
         }
     except: return None
 
@@ -76,10 +67,13 @@ res = supabase.table("watchlist").select("*").execute()
 df_db = pd.DataFrame(res.data)
 
 with st.sidebar:
-    st.header("⚙️ Steuerung")
-    view_option = st.selectbox("Watchlist Filter:", ["Alle", "Tranche", "Sparplan"])
+    st.header("⚙️ Verwaltung")
+    view_option = st.selectbox("Hauptansicht:", ["Tranchen-Käufe", "Sparpläne", "ATH-Korrektur Check (Alle)"])
     
     st.divider()
+    base_mos = st.slider("Margin of Safety %", 0, 50, 15)
+    t2_drop = st.slider("Tranche 2 (Korrektur vom ATH %)", 10, 60, 30)
+    
     with st.expander("➕ Aktie hinzufügen"):
         with st.form("add_form", clear_on_submit=True):
             in_ticker = st.text_input("Ticker").upper()
@@ -90,78 +84,78 @@ with st.sidebar:
                 st.cache_data.clear()
                 st.rerun()
 
-    if not df_db.empty:
-        with st.expander("🗑️ Aktie löschen"):
-            ticker_del = st.selectbox("Ticker", ["-"] + df_db['ticker'].tolist())
-            if st.button("Löschen") and ticker_del != "-":
-                supabase.table("watchlist").delete().eq("ticker", ticker_del).execute()
-                st.cache_data.clear()
-                st.rerun()
-
-    st.divider()
-    base_mos = st.slider("Margin of Safety %", 0, 50, 15)
-    t1_drop = st.slider("Tranche 1 (ATH-Korr %)", 5, 50, 15)
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
 
 # --- 4. DASHBOARD ---
 vix, fg, spy_p = get_market_indicators()
-st.title("🏛️ Professional Investment Cockpit")
+st.title("🏛️ Professional Multi-Strategy Cockpit")
 
+# Marktlage-Banner
 c1, c2, c3 = st.columns(3)
-c1.metric("VIX Index", vix, "Volatilität")
-c2.metric("Fear & Greed", f"{fg}/100", "Sentiment")
+c1.metric("VIX", vix, "Angst")
+c2.metric("Fear & Greed", f"{fg}/100", "Stimmung")
 c3.metric("S&P 500 (1Y)", f"{round(spy_p, 1)}%", "Benchmark")
 
 if not df_db.empty:
-    if view_option != "Alle":
-        df_show = df_db[df_db['watchlist_type'].str.lower() == view_option.lower()]
-    else:
+    # Filter-Logik für die 3 Listen
+    if "ATH-Korrektur" in view_option:
         df_show = df_db
+    elif "Sparpläne" in view_option:
+        df_show = df_db[df_db['watchlist_type'].str.lower() == "sparplan"]
+    else:
+        df_show = df_db[df_db['watchlist_type'].str.lower() == "tranche"]
 
-    if not df_show.empty:
-        m_list, s_list, p_agg = [], [], []
+    m_data = []
+    with st.spinner("Analysiere Daten..."):
         for _, r in df_show.iterrows():
             m = get_metrics(r['ticker'])
             if m:
-                adj_fv = r['fair_value'] * (1 - (base_mos/100))
-                t1_p = m['ATH'] * (1 - t1_drop/100)
-                status = "🎯 BEREIT" if m['Preis'] <= t1_p and m['Preis'] <= adj_fv else "⏳ Warten"
+                # Berechnungen für Tranche 1 & 2
+                t1_price = r['fair_value'] * (1 - (base_mos/100))
+                t2_price = m['ATH'] * (1 - (t2_drop/100))
                 
-                m_list.append({"Ticker": r['ticker'], "Name": m['Name'], "Kurs": m['Preis'], "Trend": m['Trend'], "RSI": m['RSI'], "Vol": m['Vol'], "KGV": m['KGV']})
-                s_list.append({"Ticker": r['ticker'], "Fair Value": r['fair_value'], "MoS-Preis": round(adj_fv, 2), "Abstand T1 %": round(((m['Preis']/t1_p)-1)*100, 1), "Status": status, "Div %": m['Div']})
-                p_agg.append(m['Perf'])
+                status = "🎯 BEREIT" if m['Preis'] <= t1_price or m['Preis'] <= t2_price else "⏳ Warten"
+                
+                m_data.append({
+                    "Ticker": r['ticker'],
+                    "Name": m['Name'],
+                    "Kurs": m['Preis'],
+                    "Fair Value": r['fair_value'],
+                    "Tranche 1 (MoS)": round(t1_price, 2),
+                    "Tranche 2 (ATH-Korr)": round(t2_price, 2),
+                    "Abstand ATH %": m['ATH_Dist'],
+                    "Ø Perf %": m['Avg_Perf'],
+                    "Trend": m['Trend'],
+                    "RSI": m['RSI'],
+                    "Status": status
+                })
 
-        # Performance Check
-        with st.expander("📈 PRÄZISE PERFORMANCE-ANALYSE (DURCHSCHNITT)"):
-            pa = pd.DataFrame(p_agg).mean()
-            cols = st.columns(5)
-            for i, (k, v) in enumerate(pa.items()):
-                cols[i].metric(k, f"{round(v, 2)}%")
-
-        # Tabellen
-        t1, t2 = st.tabs(["📊 Marktdaten", "🎯 Kauf-Strategie"])
-        with t1: st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
-        with t2: st.dataframe(pd.DataFrame(s_list).style.apply(lambda x: ['background-color: #004d00' if "🎯" in str(x.Status) else '' for i in x], axis=1), use_container_width=True, hide_index=True)
-
-        # --- 5. KI ANALYSE TERMINAL ---
-        st.divider()
-        st.subheader("🤖 KI Analyse Terminal")
-        ki_ticker = st.selectbox("Aktie wählen:", [x['Ticker'] for x in m_list])
-        ki_task = st.selectbox("Analyse-Modus:", [
-            "1. Full Equity Report (Fundamentaldaten & Moat)",
-            "2. Fair Value Check (DCF & KGV Vergleich)",
-            "3. Dividenden-Sicherheit & Historie",
-            "4. Crash-Resistenz & Risiko-Profil"
-        ])
+    if m_data:
+        df_final = pd.DataFrame(m_data)
         
-        if st.button("KI-Prozess starten"):
-            m_ctx = next(i for i in m_list if i["Ticker"] == ki_ticker)
-            s_ctx = next(i for i in s_list if i["Ticker"] == ki_ticker)
-            prompt = f"""Führe Analyse '{ki_task}' für {ki_ticker} ({m_ctx['Name']}) durch.
-            Daten: Kurs {m_ctx['Kurs']}, KGV {m_ctx['KGV']}, RSI {m_ctx['RSI']}, Div {s_ctx['Div %']}%.
-            Status: {s_ctx['Status']}. Marktumfeld: VIX {vix}, F&G {fg}.
-            Antworte präzise wie ein Investmentbanker."""
+        # Ansicht 1 & 2: Sparplan / Tranche
+        if "ATH-Korrektur" not in view_option:
+            st.subheader(f"📋 {view_option} Übersicht")
+            # Spalten: Kurs, Fair Value, Tranche 1, Tranche 2
+            cols_to_show = ["Ticker", "Name", "Kurs", "Fair Value", "Tranche 1 (MoS)", "Tranche 2 (ATH-Korr)", "Status"]
+            st.dataframe(df_final[cols_to_show].style.apply(lambda x: ['background-color: #004d00' if "🎯" in str(x.Status) else '' for i in x], axis=1), use_container_width=True, hide_index=True)
+        
+        # Ansicht 3: ATH & Durchschnitts-Check
+        else:
+            st.subheader("📉 Allzeithoch-Korrekturen & Performance-Check (Alle)")
+            cols_to_show = ["Ticker", "Name", "Kurs", "Abstand ATH %", "Ø Perf %", "RSI", "Trend"]
+            st.dataframe(df_final[cols_to_show].sort_values("Abstand ATH %"), use_container_width=True, hide_index=True)
+
+        # --- KI ANALYSE ---
+        st.divider()
+        ki_ticker = st.selectbox("KI Analyse für:", df_final['Ticker'].tolist())
+        if st.button("KI Analyse starten"):
+            row = df_final[df_final['Ticker'] == ki_ticker].iloc[0]
+            prompt = f"Analyse für {ki_ticker}. Kurs {row['Kurs']}, Fair Value {row['Fair Value']}, Korrektur vom ATH: {row['Abstand ATH %']}%. Trend: {row['Trend']}. Lohnt sich ein Einstieg?"
             with st.chat_message("assistant"):
                 st.markdown(ki_model.generate_content(prompt).text)
 
 else:
-    st.info("Keine Daten vorhanden.")
+    st.info("Keine Daten vorhanden. Nutze die Sidebar zum Hinzufügen.")
