@@ -20,6 +20,16 @@ def get_supabase():
     return create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 
 supabase = get_supabase()
+# --- DEBUG: WELCHE MODELLE SIND VERFÜGBAR? ---
+with st.expander("🛠️ KI-System-Check (Nur bei Fehlern nutzen)"):
+    if st.button("Verfügbare Modelle auflisten"):
+        try:
+            available_models = genai.list_models()
+            models_list = [m.name for m in available_models if 'generateContent' in m.supported_generation_methods]
+            st.write("Dein Key unterstützt folgende Modelle:")
+            st.json(models_list)
+        except Exception as e:
+            st.error(f"Fehler beim Abrufen der Modelle: {e}")
 
 # --- 2. FUNKTIONEN ---
 def load_watchlist():
