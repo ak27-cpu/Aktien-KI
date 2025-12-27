@@ -6,15 +6,14 @@ import numpy as np
 import google.generativeai as genai
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Investment Cockpit v8", layout="wide")
+st.set_page_config(page_title="Investment Cockpit v9", layout="wide")
 
-# Verbindung herstellen
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
     genai.configure(api_key=st.secrets["gemini_key"])
     ki_model = genai.GenerativeModel('models/gemini-2.0-flash')
 except Exception as e:
-    st.error(f"Verbindungsfehler: {e}")
+    st.error(f"Initialisierungsfehler: {e}")
     st.stop()
 
 # --- 2. DATEN-FUNKTIONEN ---
@@ -51,39 +50,55 @@ def get_metrics(ticker):
         }
     except: return None
 
-# --- 3. DATEN LADEN (VOR ALLEM ANDEREN) ---
-res = supabase.table("watchlist").select("*").execute()
-df_db = pd.DataFrame(res.data)
+# --- 3. DATEN LADEN ---
+try:
+    res = supabase.table("watchlist").select("*").execute()
+    df_db = pd.DataFrame(res.data)
+except Exception as e:
+    st.error(f"Fehler beim Laden der Supabase-Daten: {e}")
+    df_db = pd.DataFrame()
 
 # --- 4. SIDEBAR MANAGEMENT ---
 with st.sidebar:
     st.header("⚙️ Verwaltung")
     
-    # Filter-Auswahl
     view_option = st.selectbox("Watchlist Filter:", ["Alle", "Tranche", "Sparplan"])
     
     st.divider()
-    st.subheader("➕ Neu hinzufügen")
+    st.subheader("➕ Aktie hinzufügen")
     with st.form("add_form", clear_on_submit=True):
-        in_ticker = st.text_input("Ticker Symbol").upper()
+        in_ticker = st.text_input("Ticker Symbol (z.B. AAPL)").upper()
         in_fv = st.number_input("Fair Value", min_value=0.0)
-        in_type = st.selectbox("Typ", ["Tranche", "Sparplan"])
-        submit_add = st.form_submit_button("Speichern")
+        in_type = st.selectbox("Zuweisung", ["Tranche", "Sparplan"])
+        submit_add = st.form_submit_button("In Datenbank speichern")
         
         if submit_add and in_ticker:
-            new_data = {"ticker": in_ticker, "fair_value": in_fv, "watchlist_type": in_type}
-            supabase.table("watchlist").insert(new_data).execute()
-            st.success(f"{in_ticker} hinzugefügt!")
-            st.rerun()
+            try:
+                # FIX: Variable 'data' korrekt definiert
+                new_entry = {
+                    "ticker": in_ticker, 
+                    "fair_value": in_fv, 
+                    "watchlist_type": in_type
+                }
+                supabase.table("watchlist").insert(new_entry).execute()
+                st.success(f"Erfolg: {in_ticker} hinzugefügt!")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Datenbankfehler: {e}")
 
     st.divider()
-    st.subheader("🗑️ Löschen")
-    if not df_db.empty:
-        ticker_to_del = st.selectbox("Ticker wählen", df_db['ticker'].tolist())
-        if st.button("Endgültig löschen"):
-            supabase.table("watchlist").delete().eq("ticker", ticker_to_del).execute()
-            st.warning(f"{ticker_to_del} gelöscht.")
-            st.rerun()
+    st.subheader("🗑️ Aktie löschen")
+    if not df_db.empty and 'ticker' in df_db.columns:
+        ticker_to_del = st.selectbox("Ticker wählen", ["-"] + df_db['ticker'].tolist())
+        if st.button("Jetzt löschen") and ticker_to_del != "-":
+            try:
+                supabase.table("watchlist").delete().eq("ticker", ticker_to_del).execute()
+                st.warning(f"{ticker_to_del} wurde gelöscht.")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Fehler beim Löschen: {e}")
 
     st.divider()
     base_mos = st.slider("Margin of Safety %", 0, 50, 15)
@@ -91,32 +106,32 @@ with st.sidebar:
 
 # --- 5. DASHBOARD ANZEIGE ---
 vix, fg, spy_p = get_market_indicators()
-st.title("🏛️ Investment Cockpit Ultimate")
+st.title("🏛️ Professional Investment Cockpit")
 
+# Banner
 c1, c2, c3 = st.columns(3)
-c1.metric("VIX", vix)
-c2.metric("Fear & Greed", f"{fg}/100")
-c3.metric("S&P 500 (1Y)", f"{round(spy_p, 1)}%")
+c1.metric("VIX Index", vix, "Angst-Barometer")
+c2.metric("Fear & Greed", f"{fg}/100", "Marktstimmung")
+c3.metric("S&P 500 (1Y)", f"{round(spy_p, 1)}%", "Benchmark")
 
 if not df_db.empty:
-    # SPALTEN-CHECK DIAGNOSE
+    # SPALTEN-VALIDIERUNG
     if 'watchlist_type' not in df_db.columns:
-        st.error("🚨 FEHLER: Die Spalte 'watchlist_type' existiert nicht in deiner Supabase Tabelle!")
+        st.error("🚨 Spalte 'watchlist_type' fehlt in Supabase. Bitte manuell anlegen!")
         st.stop()
 
-    # FILTERUNG ANWENDEN
+    # FILTERUNG
     if view_option != "Alle":
-        # Wir filtern case-insensitive, um Fehler zu vermeiden
         df_show = df_db[df_db['watchlist_type'].str.lower() == view_option.lower()]
     else:
         df_show = df_db
 
     if df_show.empty:
-        st.info(f"Keine Einträge für '{view_option}' gefunden.")
+        st.info(f"Keine Einträge für '{view_option}' vorhanden.")
     else:
         m_list, s_list, p_agg = [], [], []
         
-        with st.spinner("Berechne Daten..."):
+        with st.spinner("Aktualisiere Kurse..."):
             for _, r in df_show.iterrows():
                 m = get_metrics(r['ticker'])
                 if m:
@@ -128,8 +143,8 @@ if not df_db.empty:
                     s_list.append({"Ticker": r['ticker'], "Fair Value": r['fair_value'], "MoS-Preis": round(adj_fv, 2), "Abstand T1 %": round(((m['Preis']/t1_p)-1)*100, 1), "Status": status})
                     p_agg.append(m['Perf'])
 
-        # Performance
-        with st.expander("📈 PERFORMANCE ÜBERSICHT"):
+        # Performance Check
+        with st.expander("📈 DURCHSCHNITTS-PERFORMANCE DER LISTE"):
             if p_agg:
                 pa = pd.DataFrame(p_agg).mean()
                 pc = st.columns(5)
@@ -137,9 +152,9 @@ if not df_db.empty:
                     pc[i].metric(label, f"{round(pa[label], 2)}%")
 
         # Tabellen
-        t1, t2 = st.tabs(["📊 Markt", "🎯 Strategie"])
+        t1, t2 = st.tabs(["📊 Marktdaten", "🎯 Kauf-Strategie"])
         with t1: st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
         with t2:
             st.dataframe(pd.DataFrame(s_list).style.apply(lambda x: ['background-color: #004d00' if "🎯" in str(x.Status) else '' for i in x], axis=1), use_container_width=True, hide_index=True)
 else:
-    st.info("Datenbank leer. Nutze die Sidebar zum Hinzufügen.")
+    st.info("Datenbank ist noch leer. Füge deine erste Aktie in der Sidebar hinzu!")
