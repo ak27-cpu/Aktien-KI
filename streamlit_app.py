@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import google.generativeai as genai
 
-# --- 1. SETUP & KONFIGURATION ---
+# --- 1. SETUP ---
 st.set_page_config(page_title="Investment Terminal 2025", layout="wide")
 
 if "gemini_key" in st.secrets:
@@ -41,25 +41,25 @@ def get_metrics(ticker):
         l = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rsi = 100 - (100 / (1 + (g/l))).iloc[-1]
         
-        d2e = info.get('debtToEquity', 0) or 0
-        debt = d2e if d2e > 5 else d2e * 100
-        
         return {
             "Preis": round(cp, 2), 
             "ATH": round(ath, 2),
             "RSI": round(rsi, 1), 
-            "Schulden": round(debt, 1),
             "Abstand_ATH": round(((cp / ath) - 1) * 100, 1)
         }
     except: return None
 
 # --- 3. UI & SIDEBAR ---
-st.title("🏛️ Professional Investment Terminal (ATH & Fair Value)")
+st.title("🏛️ Professional Investment Terminal (ATH, FV & RSI)")
 
 with st.sidebar:
     st.header("⚙️ Tranchen-Parameter")
     t1_drop = st.slider("Tranche 1 bei ATH-Korrektur (%)", 5, 50, 15)
     t2_drop = st.slider("Tranche 2 bei ATH-Korrektur (%)", 10, 70, 30)
+    
+    st.divider()
+    st.header("🛡️ RSI-Filter")
+    max_rsi_kauf = st.slider("Max. RSI für Kauffreigabe", 20, 70, 45, help="Nur wenn der RSI unter diesem Wert liegt, wird ein Kaufsignal (🎯) angezeigt.")
     
     st.divider()
     st.header("➕ Neue Aktie")
@@ -68,7 +68,6 @@ with st.sidebar:
     if st.button("Speichern"):
         if t_in:
             supabase.table("watchlist").insert({"ticker": t_in, "fair_value": fv_in}).execute()
-            st.success(f"{t_in} wurde hinzugefügt!")
             st.rerun()
 
 # --- 4. DATENVERARBEITUNG ---
@@ -82,18 +81,23 @@ if not df_db.empty:
             m = get_metrics(r['ticker'])
             if m:
                 fv = r.get('fair_value', 0) or 0
-                
-                # Tranchen-Berechnung vom ATH
                 t1_preis = m['ATH'] * (1 - t1_drop/100)
                 t2_preis = m['ATH'] * (1 - t2_drop/100)
-                
-                # Abstände berechnen
                 diff_fv = ((m['Preis'] / fv) - 1) * 100 if fv > 0 else 0
                 
-                # Signal-Logik
-                # Kaufzone wenn unter FV UND Tranche 1 vom ATH erreicht
-                status = "🎯 KAUFBEREIT" if fv > 0 and m['Preis'] <= fv and m['Preis'] <= t1_preis else "⏳ Warten"
-                if m['Preis'] <= t2_preis: status = "🔥 TR2 LIMIT"
+                # KOMPLEXE SIGNAL-LOGIK (Preis + RSI)
+                status = "⏳ Warten"
+                if m['Preis'] <= t1_preis:
+                    if m['RSI'] <= max_rsi_kauf:
+                        status = "🎯 TR1 BEREIT"
+                    else:
+                        status = "⚠️ Preis OK, RSI zu hoch"
+                
+                if m['Preis'] <= t2_preis:
+                    if m['RSI'] <= max_rsi_kauf:
+                        status = "🔥 TR2 LIMIT"
+                    else:
+                        status = "⚠️ TR2 Preis erreicht, RSI hoch"
 
                 rows.append({
                     "id": r['id'],
@@ -101,7 +105,6 @@ if not df_db.empty:
                     "Kurs": m['Preis'],
                     "Fair Value": fv,
                     "Diff_FV %": round(diff_fv, 1),
-                    "ATH": m['ATH'],
                     "Korr_ATH %": m['Abstand_ATH'],
                     "RSI": m['RSI'],
                     "Tranche 1": round(t1_preis, 2),
@@ -111,42 +114,52 @@ if not df_db.empty:
 
     df_display = pd.DataFrame(rows)
 
-    # --- TABELLE ---
-    st.subheader("📊 Multi-Faktor Watchlist")
+    # --- TABELLEN STYLING (HEATMAP) ---
+    def style_rows(row):
+        styles = [''] * len(row)
+        if "🎯" in str(row['Status']) or "🔥" in str(row['Status']):
+            styles = ['background-color: #004d00'] * len(row) # Dunkelgrün für Kaufzone
+        elif "⚠️" in str(row['Status']):
+            styles = ['background-color: #4d4d00'] * len(row) # Dunkelgelb für RSI-Warnung
+        return styles
+
+    st.subheader("📊 Multi-Faktor Watchlist & Heatmap")
     
-    # Editor für Fair Value Änderungen
-    edited_df = st.data_editor(
-        df_display,
+    st.data_editor(
+        df_display.style.apply(style_rows, axis=1),
         column_config={
             "id": None,
-            "Fair Value": st.column_config.NumberColumn("Fair Value (€)", format="%.2f"),
-            "Diff_FV %": st.column_config.NumberColumn("Diff/FV", format="%.1f%%"),
-            "Korr_ATH %": st.column_config.NumberColumn("Korr/ATH", format="%.1f%%"),
+            "RSI": st.column_config.NumberColumn("RSI", help="Grün < 35, Rot > 65"),
+            "Diff_FV %": st.column_config.NumberColumn("Abstand FV %", format="%.1f%%"),
+            "Status": st.column_config.TextColumn("Handlungsempfehlung")
         },
-        disabled=["Ticker", "Kurs", "Diff_FV %", "ATH", "Korr_ATH %", "RSI", "Tranche 1", "Tranche 2", "Status"],
+        disabled=list(df_display.columns), # Deaktiviert Bearbeitung in der Ansicht für Stabilität
         hide_index=True,
         use_container_width=True
     )
 
-    if st.button("💾 Alle Fair Value Änderungen speichern"):
-        for _, row in edited_df.iterrows():
-            supabase.table("watchlist").update({"fair_value": row["Fair Value"]}).eq("id", row["id"]).execute()
-        st.success("Datenbank aktualisiert!")
-        st.rerun()
-
-    # Lösch-Funktion
-    with st.expander("🗑️ Ticker entfernen"):
-        del_ticker = st.selectbox("Wähle Ticker", df_display['Ticker'])
-        if st.button("Löschen"):
-            supabase.table("watchlist").delete().eq("ticker", del_ticker).execute()
-            st.rerun()
+    # Lösch-Funktion & FV-Update in separaten Bereich für besseres UI
+    col_up, col_del = st.columns(2)
+    with col_up:
+        with st.expander("📝 Fair Value manuell anpassen"):
+            up_ticker = st.selectbox("Ticker wählen", df_display['Ticker'])
+            new_fv = st.number_input("Neuer Wert", value=0.0)
+            if st.button("Update"):
+                supabase.table("watchlist").update({"fair_value": new_fv}).eq("ticker", up_ticker).execute()
+                st.rerun()
+    
+    with col_del:
+        with st.expander("🗑️ Ticker entfernen"):
+            del_t = st.selectbox("Ticker löschen", df_display['Ticker'])
+            if st.button("Löschen"):
+                supabase.table("watchlist").delete().eq("ticker", del_t).execute()
+                st.rerun()
 
     # --- 5. EXPERTEN ANALYSE ---
     st.divider()
     st.subheader("🤖 KI Analyse-Terminal")
-    sel_ticker = st.selectbox("Aktie für Tiefenprüfung:", df_display['Ticker'])
+    sel_ticker = st.selectbox("Aktie für Tiefenprüfung:", df_display['Ticker'], key="deepdive")
     
-    # Deine erweiterten Analyse-Prozesse
     analyse_typ = st.selectbox("Analyse-Prozess wählen:", [
         "1. Komplett-Analyse (Equity Report)",
         "2. Bewertungs-Profi (Fair Value Kalkulation)",
@@ -156,19 +169,21 @@ if not df_db.empty:
         "6. Szenario-Analyse (Best/Worst Case)"
     ])
 
-    if st.button("Prozess starten"):
+    if st.button("KI Prozess starten"):
         stock_context = df_display[df_display['Ticker'] == sel_ticker].iloc[0].to_dict()
         
+        # Hier habe ich deine spezifischen Analyse-Anweisungen eingebaut
         prompts = {
-            "1. Komplett-Analyse (Equity Report)": f"Analysiere {sel_ticker} wie ein Profi-Equity-Analyst: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanz, 5. Dividende, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Daten: {stock_context}",
-            "2. Bewertungs-Profi (Fair Value Kalkulation)": f"Berechne für {sel_ticker} einen fairen Wert aus DCF & KGV. Vergleiche mit meinem FV von {stock_context['Fair Value']}€. Daten: {stock_context}",
-            "3. Dividenden-Sicherheits-Check": f"Untersuche die Dividende von {sel_ticker}: Payout-Ratio, Historie & Sicherheit. Daten: {stock_context}",
-            "4. Konkurrenz-Ranking (Market Share)": f"Vergleiche {sel_ticker} mit den Top-Wettbewerbern. Margen- & Burggraben-Check. Daten: {stock_context}",
-            "5. Crash-Resistenz-Test": f"Wie hat sich {sel_ticker} historisch in Bärenmärkten verhalten? Maximale Drawdowns. Daten: {stock_context}",
-            "6. Szenario-Analyse (Best/Worst Case)": f"Erstelle 3 Kurs-Szenarien für {sel_ticker} auf Sicht von 24 Monaten basierend auf Wachstumsprognosen. Daten: {stock_context}"
+            "1. Komplett-Analyse (Equity Report)": f"Analysiere {sel_ticker} wie ein Profi: 1. Geschäftsmodell, 2. Fundamentaldaten, 3. Bewertung, 4. Bilanz, 5. Dividende, 6. Chancen/Risiken, 7. Szenarien, 8. Fazit. Kontext: {stock_context}",
+            "2. Bewertungs-Profi (Fair Value Kalkulation)": f"Berechne für {sel_ticker} einen fairen Wert aus DCF & KGV. Nutze den aktuellen RSI von {stock_context['RSI']} für das Timing. Kontext: {stock_context}",
+            "3. Dividenden-Sicherheits-Check": f"Untersuche die Dividende von {sel_ticker}: Payout-Ratio, Historie & Sicherheit. Kontext: {stock_context}",
+            "4. Konkurrenz-Ranking (Market Share)": f"Vergleiche {sel_ticker} mit den Top-Wettbewerbern. Margen- & Burggraben-Check.",
+            "5. Crash-Resistenz-Test": f"Wie hat sich {sel_ticker} historisch in Bärenmärkten verhalten? Drawdowns & Recovery.",
+            "6. Szenario-Analyse (Best/Worst Case)": f"Erstelle 3 Kurs-Szenarien auf 24 Monate für {sel_ticker}."
         }
         
         with st.chat_message("assistant"):
             st.markdown(ask_ki(prompts[analyse_typ]))
+
 else:
     st.info("Watchlist ist leer.")
