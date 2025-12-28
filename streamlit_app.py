@@ -65,15 +65,10 @@ with st.sidebar:
     st.header("⚙️ Steuerung")
     view = st.radio("Ansicht:", ["Alle", "Tranche", "Sparplan"])
     st.divider()
-    base_mos = st.slider("Margin of Safety % (T1)", 0, 50, 15)
-    t2_drop = st.slider("ATH-Korrektur % (T2)", 10, 60, 30)
+    base_mos = st.slider("Margin of Safety % (T1)", 0, 50, 10)
+    t2_drop = st.slider("ATH-Korrektur % (T2)", 10, 60, 20)
     
-    with st.expander("🗑️ Aktie löschen"):
-        if not df_db.empty:
-            target = st.selectbox("Ticker", ["-"] + sorted(df_db['ticker'].tolist()))
-            if st.button("Löschen") and target != "-":
-                supabase.table("watchlist").delete().eq("ticker", target).execute()
-                st.rerun()
+   
 
 # --- 5. HAUPTANZEIGE ---
 st.title(f"🏛️ Smart Investment Cockpit")
