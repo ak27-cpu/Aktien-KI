@@ -7,7 +7,7 @@ import google.generativeai as genai
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Investment Cockpit v23", layout="wide")
+st.set_page_config(page_title="Investment Cockpit ", layout="wide")
 
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
@@ -72,7 +72,7 @@ def get_metrics(ticker):
 
 # --- 3. HEADER ---
 vix, fg = get_market_indicators()
-st.title("🏛️ Professional Investment Cockpit")
+st.title("🏛️ Investment Cockpit")
 c1, c2 = st.columns(2)
 c1.metric("VIX (Angst)", vix)
 c2.metric("Fear & Greed Index", f"{fg}/100")
@@ -108,9 +108,9 @@ if not df_db.empty:
         df = pd.DataFrame(m_data)
         tab1, tab2, tab3 = st.tabs(["📊 Markt", "🎯 Technik", "🚀 Strategie"])
         
-        with tab1: st.dataframe(df[["Ticker", "Name", "Sektor", "Preis", "FV"]], use_container_width=True, hide_index=True)
+        with tab1: st.dataframe(df[["Ticker", "Name", "Sektor", "Preis", "FV", "RSI"]], use_container_width=True, hide_index=True)
         with tab2: st.dataframe(df[["Ticker", "Korr_Akt", "Korr_Avg", "RSI", "Trend", "Vol_Info"]], use_container_width=True, hide_index=True)
-        with tab3: st.dataframe(df[["Ticker", "Preis", "FV", "T1 (-10%)", "T2 (-20%)", "Empfehlung"]].style.apply(
+        with tab3: st.dataframe(df[["Ticker", "Preis", "FV", "T1 (-10%)", "T2 (-20%)", "RSI", "Empfehlung"]].style.apply(
                 lambda x: ['background-color: #004d00' if "🟢" in str(x.Empfehlung) else '' for i in x], axis=1), 
                 use_container_width=True, hide_index=True)
 
