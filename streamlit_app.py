@@ -23,7 +23,6 @@ def get_market_indicators():
         vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
         spy = yf.Ticker("^GSPC").history(period="300d")
         cp = spy['Close'].iloc[-1]
-        spy_1y = ((cp / spy['Close'].iloc[0]) - 1) * 100
         sma125 = spy['Close'].rolling(125).mean().iloc[-1]
         fg_score = int((cp / sma125) * 50)
         return round(vix, 2), min(100, fg_score), round(spy_1y, 2)
